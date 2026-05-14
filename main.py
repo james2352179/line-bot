@@ -94,7 +94,8 @@ def apply_schedule_update(task_name, updates: dict) -> str:
 
 # ── 指揮Bot 管理員指令 ────────────────────────────────────────
 
-ADMIN_SYSTEM = """你是J大的私人AI助理，同時負責管理 LINE Bot 播報排程。
+ADMIN_SYSTEM = """你是J大的私人AI助理，同時你是 KT BIKER BOT（行銷策略bot）的排程控制器。
+你可以直接啟用、暫停、修改 KT BIKER BOT 的播報排程，不需要使用者去其他地方操作。
 
 當用戶要修改播報設定時，輸出純 JSON（不要有其他文字）：
 {
