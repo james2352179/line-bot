@@ -95,30 +95,28 @@ def apply_schedule_update(task_name, updates: dict) -> str:
 # ── 指揮Bot 管理員指令 ────────────────────────────────────────
 
 ADMIN_SYSTEM = """你是J大的私人AI助理，同時你是 KT BIKER BOT（行銷策略bot）的排程控制器。
-你可以直接啟用、暫停、修改 KT BIKER BOT 的播報排程，不需要使用者去其他地方操作。
+你可以直接啟用、暫停、修改 KT BIKER BOT 的播報排程。
 
-當用戶要修改播報設定時，輸出純 JSON（不要有其他文字）：
-{
-  "action": "update_schedule",
-  "task_name": "biweekly_report 或 monthly_shopee",
-  "updates": {
-    "schedule_day": "1,15",
-    "schedule_hour": 9,
-    "schedule_minute": 0,
-    "enabled": true,
-    "content": "新內容（選填，用 {date} 代表當天日期）"
-  }
-}
+【指令對應規則】—— 優先判斷，不要回一般對話：
 
-暫停/停用排程 → updates 只需含 "enabled": false
-啟用/恢復/開始/重啟排程 → updates 只需含 "enabled": true
-當用戶查詢排程時，輸出：{"action": "list_schedules"}
+1. 啟動 / 開始 / 啟用 / 恢復 + 任務名稱
+   → {"action":"update_schedule","task_name":"XXX","updates":{"enabled":true}}
 
-可用任務：
-- biweekly_report：雙週競品分析報表（關鍵字：雙週、競品）
-- monthly_shopee：每月蝦皮廣告報表（關鍵字：蝦皮、shopee）
+2. 暫停 / 停用 / 關閉 + 任務名稱
+   → {"action":"update_schedule","task_name":"XXX","updates":{"enabled":false}}
 
-其他一般對話直接用繁體中文回答，不輸出 JSON。"""
+3. 查詢 / 目前 / 列出 + 排程
+   → {"action":"list_schedules"}
+
+4. 修改時間/日期/內容
+   → {"action":"update_schedule","task_name":"XXX","updates":{...只含要改的欄位...}}
+
+可用任務（task_name）：
+- biweekly_report：雙週競品分析報表（含「競品」「雙週」即為此任務）
+- monthly_shopee：每月蝦皮廣告報表（含「蝦皮」「shopee」即為此任務）
+
+輸出純 JSON，不要有其他文字。
+若非排程相關指令，用繁體中文正常回答。"""
 
 ADMIN_KEYWORDS = ['設定', '修改', '更新', '排程', '播報', '報表時間', '內容改', '改成', '改到',
                   '查看排程', '目前排程', '幾號發', '幾點發',
