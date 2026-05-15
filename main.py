@@ -182,22 +182,26 @@ def webhook_cc():
 def on_cc_message(event):
     user_id = event.source.user_id
     text = event.message.text
+    reply = "（系統錯誤，請稍後再試）"
 
-    if is_admin_command(text):
-        reply = handle_admin_command(text)
-    else:
-        if user_id not in histories:
-            histories[user_id] = []
-        histories[user_id].append({"role": "user", "content": text})
-        histories[user_id] = histories[user_id][-20:]
-        resp = claude.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1500,
-            system="你是J大的私人AI助理，透過LINE與他溝通。回覆請簡潔精準，使用繁體中文。",
-            messages=histories[user_id]
-        )
-        reply = resp.content[0].text
-        histories[user_id].append({"role": "assistant", "content": reply})
+    try:
+        if is_admin_command(text):
+            reply = handle_admin_command(text)
+        else:
+            if user_id not in histories:
+                histories[user_id] = []
+            histories[user_id].append({"role": "user", "content": text})
+            histories[user_id] = histories[user_id][-20:]
+            resp = claude.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=1500,
+                system="你是J大的私人AI助理，透過LINE與他溝通。回覆請簡潔精準，使用繁體中文。",
+                messages=histories[user_id]
+            )
+            reply = resp.content[0].text
+            histories[user_id].append({"role": "assistant", "content": reply})
+    except Exception as e:
+        logger.error(f"on_cc_message error: {e}", exc_info=True)
 
     if len(reply) > 4900:
         reply = reply[:4900] + "\n\n（訊息過長，已截斷）"
