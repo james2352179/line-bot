@@ -40,11 +40,14 @@ def _import_auto():
 
 def _run_competitor(params: dict):
     return _import_auto().push_competitor_report(
-        profile_keyword=params.get("profile") or None
+        profile_keyword=params.get("profile") or None,
+        target=params.get("target", "both"),
     )
 
 def _run_shopee(params: dict):
-    return _import_auto().push_shopee_report()
+    return _import_auto().push_shopee_report(
+        target=params.get("target", "both"),
+    )
 
 TASK_HANDLERS = {
     "competitor_analysis": _run_competitor,

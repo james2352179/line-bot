@@ -72,7 +72,7 @@ def _kpi_compare(current: dict, previous: dict) -> dict:
     return result
 
 
-def push_shopee_report():
+def push_shopee_report(target: str = "both"):
     # 加入蝦皮工具路徑（只加一次）
     shopee_str = str(SHOPEE_TOOL_DIR)
     if shopee_str not in sys.path:
@@ -129,8 +129,11 @@ def push_shopee_report():
     )
 
     message = f"📊 蝦皮廣告報表｜{latest_period}\n\n{url}"
-    push(message)
-    log.info(f"蝦皮報表已推播: {latest_period} {url}")
+    if target != "cc_only":
+        push(message)
+        log.info(f"蝦皮報表已推播: {latest_period} {url}（→員工群）")
+    else:
+        log.info(f"蝦皮報表完成: {latest_period} {url}（僅回傳 CC）")
     return message
 
 
@@ -197,7 +200,7 @@ def _run_analysis_and_wait():
     return False
 
 
-def push_competitor_report(profile_keyword: str | None = None):
+def push_competitor_report(profile_keyword: str | None = None, target: str = "both"):
     if not _webapp_ready():
         if not _start_webapp():
             push("⚠️ 競品戰情室啟動逾時，請手動執行。")
@@ -278,8 +281,11 @@ def push_competitor_report(profile_keyword: str | None = None):
         return None
 
     message = "\n".join(lines)
-    push(message)
-    log.info(f"競品報表推播完成：{len(lines) - 1} 個平台")
+    if target != "cc_only":
+        push(message)
+        log.info(f"競品報表推播完成：{len(lines) - 1} 個平台（→員工群）")
+    else:
+        log.info(f"競品報表完成：{len(lines) - 1} 個平台（僅回傳 CC）")
     return message
 
 
