@@ -19,10 +19,7 @@ LOG_FILE = BASE / "daemon.log"
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)s  %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
-    ],
+    handlers=[logging.StreamHandler()],
 )
 log = logging.getLogger(__name__)
 
@@ -41,9 +38,17 @@ def _import_auto():
     spec.loader.exec_module(mod)
     return mod
 
+def _run_competitor(params: dict):
+    return _import_auto().push_competitor_report(
+        profile_keyword=params.get("profile") or None
+    )
+
+def _run_shopee(params: dict):
+    return _import_auto().push_shopee_report()
+
 TASK_HANDLERS = {
-    "competitor_analysis": lambda params: _import_auto().push_competitor_report(),
-    "shopee_push":         lambda params: _import_auto().push_shopee_report(),
+    "competitor_analysis": _run_competitor,
+    "shopee_push":         _run_shopee,
 }
 
 # ── 主迴圈 ────────────────────────────────────────────────────────────────────
@@ -82,8 +87,8 @@ def poll_once():
         return
 
     try:
-        handler(params)
-        _set_status(task_id, "done", "推播完成")
+        result_msg = handler(params) or "推播完成"
+        _set_status(task_id, "done", result_msg)
         log.info(f"任務完成: {task_name}")
     except Exception as e:
         log.error(f"任務失敗: {task_name} — {e}", exc_info=True)

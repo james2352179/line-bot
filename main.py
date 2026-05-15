@@ -61,6 +61,32 @@ def make_report_func(task_name):
             logger.info(f"已發送: {task_name}")
     return send_report
 
+def notify_completed_tasks():
+    """每 60 秒輪詢已完成任務，把結果推回給下達指令的 CC 用戶"""
+    try:
+        rows = supabase.table('pending_tasks').select('*').eq('status', 'done').execute()
+        for task in rows.data:
+            params = task.get('params') or {}
+            reply_to = params.get('reply_to_user_id')
+            if not reply_to or params.get('notified'):
+                continue
+            result = (task.get('result') or '').strip()
+            task_name = task.get('task_name', '')
+            labels = {'competitor_analysis': '競品分析', 'shopee_push': '蝦皮廣告報表'}
+            label = labels.get(task_name, task_name)
+            lines = [f"✅ 【{label}】已完成，同步推播至員工群"]
+            if result and result not in ('推播完成', ''):
+                lines.append('')
+                lines.append(result)
+            push_to_group(cc_config, reply_to, '\n'.join(lines))
+            # 標記已通知，避免重複推播
+            supabase.table('pending_tasks').update(
+                {'params': {**params, 'notified': True}}
+            ).eq('id', task['id']).execute()
+            logger.info(f"已回通知 {task_name} → {reply_to[:8]}...")
+    except Exception as e:
+        logger.error(f"notify_completed_tasks error: {e}")
+
 def load_and_schedule_all():
     rows = supabase.table('bot_schedules').select('*').eq('enabled', True).execute()
     for job in rows.data:
@@ -74,6 +100,9 @@ def load_and_schedule_all():
             minute=job['schedule_minute']
         )
         logger.info(f"排程載入: {job['display_name']} 每月{job['schedule_day']}號 {job['schedule_hour']:02d}:{job['schedule_minute']:02d}")
+    # 任務完成回通知（每 60 秒檢查一次）
+    if not scheduler.get_job('notify_completed'):
+        scheduler.add_job(notify_completed_tasks, 'interval', id='notify_completed', seconds=60)
 
 def apply_schedule_update(task_name, updates: dict) -> str:
     updates['updated_at'] = datetime.now().isoformat()
@@ -94,58 +123,66 @@ def apply_schedule_update(task_name, updates: dict) -> str:
 
 # ── 指揮Bot 管理員指令 ────────────────────────────────────────
 
-ADMIN_SYSTEM = """你是J大的私人AI助理，同時你是 KT BIKER BOT（行銷策略bot）的指揮控制器。
-你可以啟用、暫停、修改排程，也可以立即手動推播到員工群。
+ADMIN_SYSTEM = """你是J大的私人AI助理，同時是 KT BIKER BOT 的指揮控制器。
+你具備完整的語意理解能力，能夠從自然語言中識別意圖，並輸出精確的 JSON 指令。
 
-【指令對應規則】—— 優先判斷，不要回一般對話：
+【輸出規則】
+- 若識別到以下任一意圖：輸出純 JSON，不得有其他文字
+- 若為一般對話（問候、閒聊、非指令）：用繁體中文自然回答
 
-1. 啟動 / 開始 / 啟用 / 恢復 + 任務名稱
+【指令意圖對應】
+
+A. 啟用任務（含「啟動」「開始」「恢復」「重啟」「打開」+任務名稱）
    → {"action":"update_schedule","task_name":"XXX","updates":{"enabled":true}}
 
-2. 暫停 / 停用 / 關閉 + 任務名稱
+B. 暫停任務（含「暫停」「停用」「關閉」「停止」+任務名稱）
    → {"action":"update_schedule","task_name":"XXX","updates":{"enabled":false}}
 
-3. 查詢 / 目前 / 列出 + 排程
+C. 查詢排程（含「查看」「目前」「列出」「有哪些」「排程狀態」）
    → {"action":"list_schedules"}
 
-4. 修改時間/日期/內容
-   → {"action":"update_schedule","task_name":"XXX","updates":{...只含要改的欄位...}}
+D. 修改排程設定（時間、日期、內容）
+   → {"action":"update_schedule","task_name":"XXX","updates":{只含要改的欄位}}
 
-5. 推播 / 立即推播 / 手動推播 + 蝦皮 / shopee（無附 URL）
+E. 推播蝦皮報表（含「蝦皮」「shopee」，無 URL）
    → {"action":"trigger_local","task_name":"shopee_push"}
-   ⚠️ 蝦皮報表必須走 trigger_local，不可用 manual_push（需讀取本地最新資料）
 
-6. 推播 / 立即推播 / 手動推播 + 競品 / 雙週（無附 URL）
-   → {"action":"trigger_local","task_name":"competitor_analysis"}
-   ⚠️ 競品報表必須走 trigger_local，不可用 manual_push（需執行本地分析工具）
+F. 競品分析（含「競品」「分析」「戰情」，可指定客戶設定檔）
+   - 有指定客戶名稱（如「汽美」「汽車美容」「KT」等）：
+     → {"action":"trigger_local","task_name":"competitor_analysis","profile":"[客戶名稱關鍵詞]"}
+   - 未指定客戶：
+     → {"action":"trigger_local","task_name":"competitor_analysis"}
+   ✦ 範例：「請執行汽美用品的競品分析傳上來」→ {"action":"trigger_local","task_name":"competitor_analysis","profile":"汽美用品"}
+   ✦ 範例：「幫我跑一下競品戰情」→ {"action":"trigger_local","task_name":"competitor_analysis"}
 
-7. 推播 / 發送 + URL（訊息中含 http）
+G. 推播含 URL 的訊息（訊息中含 http）
    → {"action":"push_url","url":"https://...","message":"前綴說明（選填）"}
 
-8. 執行工具 / 啟動分析 / 跑分析 + 工具名稱（需要 Mac 本地執行）
-   → {"action":"trigger_local","task_name":"XXX"}
+【可用排程任務 task_name】（僅用於 update_schedule）
+- biweekly_report：雙週競品分析（含「競品」「雙週」關鍵詞）
+- monthly_shopee：每月蝦皮廣告報表（含「蝦皮」「shopee」關鍵詞）
 
-可用排程任務（task_name for update_schedule）：
-- biweekly_report：雙週競品分析報表（含「競品」「雙週」即為此任務）
-- monthly_shopee：每月蝦皮廣告報表（含「蝦皮」「shopee」即為此任務）
-
-可用本地工具（task_name for trigger_local）：
-- competitor_analysis：競品戰情室分析（汽車美容用品業）
+【可用本地工具 task_name】（用於 trigger_local）
+- competitor_analysis：競品戰情室分析
 - shopee_push：蝦皮廣告報表推播
 
-輸出純 JSON，不要有其他文字。
-若非排程相關指令，用繁體中文正常回答。"""
+【語意理解原則】
+- 「傳上來」「傳給我看」「我想看」→ 執行工具並通知
+- 「傳到群組」「推播到員工群」→ 執行工具並推播
+- 「汽美」「汽車美容」「汽美用品」→ profile 關鍵詞為「汽美」
+- 未指定客戶時，使用預設設定檔（汽車美容用品業）"""
 
 ADMIN_KEYWORDS = ['設定', '修改', '更新', '排程', '播報', '報表時間', '內容改', '改成', '改到',
                   '查看排程', '目前排程', '幾號發', '幾點發',
                   '暫停', '停用', '啟用', '恢復', '開始', '重啟', '重新啟動',
                   '推播', '立即推', '手動推', '馬上發', '發送報表', '立刻發',
-                  '執行工具', '執行分析', '啟動分析', '跑分析', '執行競品', '執行蝦皮']
+                  '執行工具', '執行分析', '啟動分析', '跑分析', '執行競品', '執行蝦皮',
+                  '競品', '分析', '戰情', '蝦皮報表', '傳上來', '傳給我', '傳給我看']
 
 def is_admin_command(text: str) -> bool:
     return any(k in text for k in ADMIN_KEYWORDS)
 
-def handle_admin_command(text: str) -> str:
+def handle_admin_command(text: str, user_id: str = None) -> str:
     resp = claude.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=600,
@@ -206,16 +243,24 @@ def handle_admin_command(text: str) -> str:
                 task_name = cmd.get('task_name', '')
                 if not task_name:
                     return "❌ 無法識別要執行的工具"
+                profile = cmd.get('profile', '').strip()
+                params = {}
+                if profile:
+                    params['profile'] = profile
+                if user_id:
+                    params['reply_to_user_id'] = user_id
                 supabase.table('pending_tasks').insert({
                     'task_name': task_name,
                     'status': 'pending',
+                    'params': params,
                 }).execute()
                 task_labels = {
                     'competitor_analysis': '競品戰情室分析',
                     'shopee_push': '蝦皮廣告報表推播',
                 }
                 label = task_labels.get(task_name, task_name)
-                return f"✅ 已下達指令：【{label}】\nMac daemon 收到後會自動執行，完成後結果會推播到員工群。\n（請確保 Mac 已開機）"
+                profile_hint = f"（{profile}）" if profile else ""
+                return f"✅ 已下達指令：【{label}】{profile_hint}\nMac 收到後開始執行，完成後會把結果傳回這裡和員工群。\n（請確保 Mac 已開機）"
 
     except Exception as e:
         logger.error(f"Admin parse error: {e}, raw: {result}")
@@ -242,7 +287,7 @@ def on_cc_message(event):
 
     try:
         if is_admin_command(text):
-            reply = handle_admin_command(text)
+            reply = handle_admin_command(text, user_id=user_id)
         else:
             if user_id not in histories:
                 histories[user_id] = []
