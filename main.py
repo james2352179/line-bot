@@ -13,7 +13,7 @@ from linebot.v3.webhooks import MessageEvent, TextMessageContent, JoinEvent
 from linebot.v3.exceptions import InvalidSignatureError
 import anthropic
 from apscheduler.schedulers.background import BackgroundScheduler
-from datetime import datetime
+from datetime import datetime, timedelta
 from supabase import create_client
 
 logging.basicConfig(level=logging.INFO)
@@ -36,8 +36,10 @@ kt_handler = WebhookHandler(KT_CHANNEL_SECRET)
 kt_config = Configuration(access_token=KT_CHANNEL_ACCESS_TOKEN)
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+MAX_HISTORY_USERS = 50
 histories = {}        # user_id → list[{role,content}]，記憶體快取
-pending_actions = {}  # user_id → 待確認的任務 dict
+pending_actions = {}  # user_id → (任務 dict, 建立時間)
+PENDING_TTL = timedelta(minutes=10)
 scheduler = BackgroundScheduler(timezone="Asia/Taipei")
 
 
@@ -59,6 +61,9 @@ def load_history(user_id: str) -> list:
     except Exception as e:
         logger.warning(f"load_history error: {e}")
         msgs = []
+    if len(histories) >= MAX_HISTORY_USERS:
+        oldest = next(iter(histories))
+        del histories[oldest]
     histories[user_id] = msgs
     return msgs
 
@@ -98,13 +103,13 @@ def make_report_func(task_name):
     return send_report
 
 def notify_completed_tasks():
-    """每 60 秒輪詢已完成任務，把結果推回給下達指令的 CC 用戶"""
+    """每 60 秒輪詢已完成任務，把結果推回給下達指令的 CC 用戶，通知後刪除 row"""
     try:
         rows = supabase.table('pending_tasks').select('*').eq('status', 'done').execute()
         for task in rows.data:
             params = task.get('params') or {}
             reply_to = params.get('reply_to_user_id')
-            if not reply_to or params.get('notified'):
+            if not reply_to:
                 continue
             result = (task.get('result') or '').strip()
             task_name = task.get('task_name', '')
@@ -117,10 +122,8 @@ def notify_completed_tasks():
                 lines.append('')
                 lines.append(result)
             push_to_group(cc_config, reply_to, '\n'.join(lines))
-            supabase.table('pending_tasks').update(
-                {'params': {**params, 'notified': True}}
-            ).eq('id', task['id']).execute()
-            logger.info(f"已回通知 {task_name} → {reply_to[:8]}...")
+            supabase.table('pending_tasks').delete().eq('id', task['id']).execute()
+            logger.info(f"已回通知並刪除 {task_name} → {reply_to[:8]}...")
     except Exception as e:
         logger.error(f"notify_completed_tasks error: {e}")
 
@@ -259,7 +262,7 @@ def execute_command(cmd: dict, user_id: str = None) -> str:
         task_name = cmd.get('task_name', '')
         profile = cmd.get('profile', '').strip()
         if user_id:
-            pending_actions[user_id] = {'task_name': task_name, 'profile': profile}
+            pending_actions[user_id] = ({'task_name': task_name, 'profile': profile}, datetime.now())
         task_labels = {'competitor_analysis': '競品分析', 'shopee_push': '蝦皮廣告報表'}
         label = task_labels.get(task_name, task_name)
         profile_hint = f"「{profile}」的" if profile else ""
@@ -357,9 +360,15 @@ def on_cc_message(event):
     reply = "（系統錯誤，請稍後再試）"
 
     try:
+        # 清除超時的 pending_actions
+        expired = [uid for uid, (_, ts) in pending_actions.items()
+                   if datetime.now() - ts > PENDING_TTL]
+        for uid in expired:
+            del pending_actions[uid]
+
         if user_id in pending_actions:
             # ask_target 確認流程
-            pending = pending_actions.pop(user_id)
+            pending, _ = pending_actions.pop(user_id)
             reply = resolve_pending_action(pending, text, user_id)
             history = load_history(user_id)
             history.append({"role": "user", "content": text})

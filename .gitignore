@@ -1,0 +1,15 @@
+# 憑證與 token
+*.env
+!*.env.example
+
+# Log
+*.log
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# macOS
+.DS_Store

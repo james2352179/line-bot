@@ -30,13 +30,18 @@ POLL_INTERVAL = 60  # 秒
 
 # ── Task handlers ─────────────────────────────────────────────────────────────
 
+_auto_mod = None  # 第一次載入後快取，避免每次任務都重載模組
+
 def _import_auto():
-    """延遲 import，避免 daemon 啟動時缺少 env 而崩潰。"""
-    import importlib.util, sys
-    spec = importlib.util.spec_from_file_location("kt_biker_auto", BASE / "kt_biker_auto.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    """延遲 import，避免 daemon 啟動時缺少 env 而崩潰；載入後快取。"""
+    global _auto_mod
+    if _auto_mod is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("kt_biker_auto", BASE / "kt_biker_auto.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _auto_mod = mod
+    return _auto_mod
 
 def _run_competitor(params: dict):
     return _import_auto().push_competitor_report(
