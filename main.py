@@ -103,27 +103,33 @@ def make_report_func(task_name):
     return send_report
 
 def notify_completed_tasks():
-    """每 60 秒輪詢已完成任務，把結果推回給下達指令的 CC 用戶，通知後刪除 row"""
+    """每 60 秒輪詢已完成/失敗任務，把結果推回給下達指令的 CC 用戶，通知後刪除 row"""
     try:
-        rows = supabase.table('pending_tasks').select('*').eq('status', 'done').execute()
+        rows = (supabase.table('pending_tasks').select('*')
+                .in_('status', ['done', 'error']).execute())
         for task in rows.data:
             params = task.get('params') or {}
             reply_to = params.get('reply_to_user_id')
             if not reply_to:
+                supabase.table('pending_tasks').delete().eq('id', task['id']).execute()
                 continue
+            status = task.get('status', 'done')
             result = (task.get('result') or '').strip()
             task_name = task.get('task_name', '')
             labels = {'competitor_analysis': '競品分析', 'shopee_push': '蝦皮廣告報表'}
             label = labels.get(task_name, task_name)
-            target = params.get('target', 'both')
-            header = f"✅ 【{label}】已完成" + ("，已同步推播至員工群" if target != 'cc_only' else "")
-            lines = [header]
-            if result and result not in ('推播完成', ''):
-                lines.append('')
-                lines.append(result)
+            if status == 'error':
+                lines = [f"❌ 【{label}】執行失敗", '', result or '（無錯誤訊息）']
+            else:
+                target = params.get('target', 'both')
+                header = f"✅ 【{label}】已完成" + ("，已同步推播至員工群" if target != 'cc_only' else "")
+                lines = [header]
+                if result and result not in ('推播完成', ''):
+                    lines.append('')
+                    lines.append(result)
             push_to_group(cc_config, reply_to, '\n'.join(lines))
             supabase.table('pending_tasks').delete().eq('id', task['id']).execute()
-            logger.info(f"已回通知並刪除 {task_name} → {reply_to[:8]}...")
+            logger.info(f"已回通知並刪除 {task_name}({status}) → {reply_to[:8]}...")
     except Exception as e:
         logger.error(f"notify_completed_tasks error: {e}")
 
@@ -302,7 +308,7 @@ def resolve_pending_action(pending: dict, response: str, user_id: str) -> str:
     elif any(k in response for k in ['群組', '員工', '推播', '群', '2', '②']):
         target = 'group'
     else:
-        pending_actions[user_id] = pending
+        pending_actions[user_id] = (pending, datetime.now())
         return "請回覆「給我個人」或「推播到群組」，我再執行。"
     return _do_trigger_local({**pending, 'target': target}, user_id)
 
@@ -312,13 +318,13 @@ def resolve_pending_action(pending: dict, response: str, user_id: str) -> str:
 def process_cc_message(text: str, user_id: str) -> str:
     """所有訊息統一入口：載入歷史 → Claude → 執行指令或回覆 → 存回記憶"""
     history = load_history(user_id)
-    history.append({"role": "user", "content": text})
+    send_history = history[-20:] + [{"role": "user", "content": text}]
 
     resp = claude.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=1500,
         system=ADMIN_SYSTEM,
-        messages=history[-20:],  # 傳最近 20 則，避免 token 過長
+        messages=send_history,
     )
     raw = resp.content[0].text.strip()
 
@@ -334,7 +340,8 @@ def process_cc_message(text: str, user_id: str) -> str:
     except Exception as e:
         logger.error(f"process_cc_message parse error: {e}, raw: {raw}")
 
-    # 更新記憶快取並異步存 Supabase
+    # API 成功後才更新快取，避免孤立 user 訊息導致對話卡死
+    history.append({"role": "user", "content": text})
     history.append({"role": "assistant", "content": reply})
     histories[user_id] = history
     save_exchange(user_id, text, reply)
