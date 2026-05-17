@@ -289,6 +289,181 @@ def push_competitor_report(profile_keyword: str | None = None, target: str = "bo
     return message
 
 
+# ── 商品表現報表推播 ───────────────────────────────────────────────────────────
+
+def _short_name(raw: str, maxlen: int = 14) -> str:
+    n = str(raw)
+    if "】" in n:
+        n = n.split("】", 1)[1].strip()
+    n = n.split("〔")[0].split(" ")[0].strip()
+    return n[:maxlen] if len(n) > maxlen else n
+
+
+def _product_perf_rule_based(period, kpis, stars, low, cart, rep) -> str:
+    total   = kpis.get("total_revenue", 0)
+    count   = int(kpis.get("product_count", 0))
+    avg_cvr = kpis.get("avg_cvr", 0)
+
+    to80 = "—"
+    top1_name, top1_rev = "（無資料）", 0
+    if stars is not None and not stars.empty:
+        if "累積佔比" in stars.columns:
+            to80 = int((stars["累積佔比"] <= 80).sum())
+        top1_name = _short_name(str(stars.iloc[0].get("商品名稱", "")))
+        top1_rev  = float(stars.iloc[0].get("銷售額", 0))
+
+    worst_cart_name, worst_cart_rate = "（無）", 0.0
+    if cart is not None and not cart.empty:
+        worst_cart_name = _short_name(str(cart.iloc[0].get("商品名稱", "")))
+        worst_cart_rate = float(cart.iloc[0].get("購→訂率", 0))
+
+    worst_low_name, worst_low_cvr, worst_low_exp = "（無）", 0.0, 0
+    if low is not None and not low.empty:
+        worst_low_name = _short_name(str(low.iloc[0].get("商品名稱", "")))
+        worst_low_cvr  = float(low.iloc[0].get("轉換率_num", 0))
+        worst_low_exp  = int(float(low.iloc[0].get("曝光", 0)))
+
+    top_rep_name, top_rep_rate = "（無）", 0.0
+    if rep is not None and not rep.empty:
+        top_rep_name = _short_name(str(rep.iloc[0].get("商品名稱", "")))
+        top_rep_rate = float(rep.iloc[0].get("回購率_num", 0))
+
+    return (
+        f"🌟 本期概況\n"
+        f"• 月銷售 ${total/10000:.1f}萬 / {count} 件商品 / 轉換率 {avg_cvr:.1f}%\n"
+        f"• 前 {to80} 件明星商品貢獻 80% 銷售集中度\n\n"
+        f"✅ 優勢\n"
+        f"• {top1_name}：${top1_rev/10000:.1f}萬（月銷售冠軍）\n"
+        f"• {top_rep_name}：回購率 {top_rep_rate:.0f}%（忠誠客核心）\n\n"
+        f"⚠️ 警示\n"
+        f"• {worst_cart_name}：購→訂率僅 {worst_cart_rate:.1f}%，棄單嚴重\n"
+        f"• {worst_low_name}：曝光 {worst_low_exp//10000:.1f}萬 → 轉換 {worst_low_cvr:.1f}%\n\n"
+        f"🎯 行動\n"
+        f"1. 立即：{worst_cart_name} 排查競品定價 / 補充客評\n"
+        f"2. 本週：{worst_low_name} 主圖 A/B 測試或調整關鍵字\n"
+        f"3. 長期：高回購耗材導入購物車提醒推播"
+    )
+
+
+def push_product_perf_report(target: str = "both"):
+    """推播商品表現分析報表（讀 product_perf_history.json 最新期，含圖表）"""
+    shopee_str = str(SHOPEE_TOOL_DIR)
+    if shopee_str not in sys.path:
+        sys.path.insert(0, shopee_str)
+
+    from core.storage.product_perf_history import ProductPerfHistory
+    from core.reporter import product_performance_exporter as pex
+    from core.reporter import product_performance_charts as pcharts
+    from core.reporter.netlify_uploader import NetlifyUploader
+
+    settings_path = SHOPEE_TOOL_DIR / "config" / "settings.json"
+    if not settings_path.exists():
+        push("⚠️ 商品表現報表：找不到工具設定檔。")
+        return
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    netlify_token = settings.get("netlify_token", "").strip()
+    if not netlify_token:
+        push("⚠️ 商品表現報表：尚未設定 Netlify Token，請先在工具中設定。")
+        return
+
+    data_dir = SHOPEE_TOOL_DIR / "data"
+    history  = ProductPerfHistory(data_dir)
+    periods  = history.get_periods()
+    if not periods:
+        push("⚠️ 商品表現報表：尚無歷史記錄，請先在工具中分析一期資料。")
+        return
+
+    latest_period = periods[0]
+    rec = history.load(latest_period)
+    kpis         = rec.get("kpis", {})
+    stars        = rec.get("stars")
+    low_cvr      = rec.get("low_cvr")
+    cart_abandon = rec.get("cart_abandon")
+    repurchase   = rec.get("repurchase")
+
+    # 生成圖表
+    chart_list = []
+    if stars is not None and not stars.empty:
+        b64_bar = pcharts.top_revenue_bar(stars)
+        if b64_bar:
+            chart_list.append(b64_bar)
+        b64_pie = pcharts.revenue_concentration_pie(stars, total_revenue=kpis.get("total_revenue", 0))
+        if b64_pie:
+            chart_list.append(b64_pie)
+
+    # AI 分析：有 API Key 就呼叫，否則規則分析
+    ai_text = _product_perf_rule_based(latest_period, kpis, stars, low_cvr, cart_abandon, repurchase)
+    api_key = settings.get("api_key", "").strip()
+    if api_key:
+        try:
+            import anthropic
+            ctx_lines = [f"【期間】{latest_period}", ""]
+            total = kpis.get("total_revenue", 0)
+            ctx_lines += [
+                f"- 總銷售額：${total:,.0f} TWD",
+                f"- 商品數：{int(kpis.get('product_count',0))} 件",
+                f"- 平均轉換率：{kpis.get('avg_cvr',0):.1f}%",
+                f"- 平均回購率：{kpis.get('avg_repurchase',0):.1f}%",
+            ]
+            if stars is not None and not stars.empty and "累積佔比" in stars.columns:
+                ctx_lines.append(f"- 80/20集中度：前 {int((stars['累積佔比']<=80).sum())} 件商品貢獻80%銷售")
+            prompt = "\n".join(ctx_lines) + """
+
+你是蝦皮商品數據分析師。根據上述數據，用繁體中文輸出極簡決策摘要。
+【輸出規則】每bullet不超過20字，含具體數字；總字數180字以內；嚴格按格式：
+
+🌟 本期概況
+• [月銷售額 $XXX萬 / X件商品 / 轉換率X%]
+• [前X件明星商品貢獻80%銷售]
+
+✅ 優勢
+• [最強商品名：金額]
+• [最高回購商品名：回購率X%]
+
+⚠️ 警示
+• [最嚴重棄單商品名：購→訂X%]
+• [最嚴重低轉換商品名：曝光X萬 → 轉換X%]
+
+🎯 行動（3條，每條15字內）
+1. 立即：[具體動作+商品名]
+2. 本週：[具體動作]
+3. 長期：[具體動作]"""
+            client = anthropic.Anthropic(api_key=api_key)
+            msg = client.messages.create(
+                model=settings.get("model", "claude-sonnet-4-6"),
+                max_tokens=600,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            ai_text = msg.content[0].text
+            log.info("商品表現 AI 分析完成")
+        except Exception as e:
+            log.warning(f"商品表現 AI 分析失敗，改用規則分析: {e}")
+
+    html = pex.generate(
+        latest_period, kpis, stars, low_cvr, cart_abandon, repurchase,
+        ai_text=ai_text, charts_b64=chart_list,
+    )
+
+    log.info(f"上傳商品表現報表：{latest_period}")
+    url = NetlifyUploader(netlify_token).upload(html)
+
+    share_path = data_dir / "product_perf_latest_share.json"
+    share_path.write_text(
+        json.dumps({"url": url, "period": latest_period,
+                    "saved_at": datetime.now().isoformat()},
+                   ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    message = f"📦 商品表現報表｜{latest_period}\n\n{url}"
+    if target != "cc_only":
+        push(message)
+        log.info(f"商品表現報表已推播: {latest_period} {url}（→員工群）")
+    else:
+        log.info(f"商品表現報表完成: {latest_period} {url}（僅回傳 CC）")
+    return message
+
+
 # ── 入口 ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -297,6 +472,8 @@ if __name__ == "__main__":
         push_shopee_report()
     elif mode == "competitor":
         push_competitor_report()
+    elif mode == "product_perf":
+        push_product_perf_report()
     else:
-        print("用法: python kt_biker_auto.py [shopee|competitor]")
+        print("用法: python kt_biker_auto.py [shopee|competitor|product_perf]")
         sys.exit(1)

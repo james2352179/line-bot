@@ -54,9 +54,15 @@ def _run_shopee(params: dict):
         target=params.get("target", "both"),
     )
 
+def _run_product_perf(params: dict):
+    return _import_auto().push_product_perf_report(
+        target=params.get("target", "both"),
+    )
+
 TASK_HANDLERS = {
     "competitor_analysis": _run_competitor,
     "shopee_push":         _run_shopee,
+    "product_perf_push":   _run_product_perf,
 }
 
 # ── 主迴圈 ────────────────────────────────────────────────────────────────────
