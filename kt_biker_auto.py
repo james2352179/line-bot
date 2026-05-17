@@ -82,15 +82,15 @@ def push_shopee_report(target: str = "both"):
     from core.reporter.html_exporter import HTMLExporter
     from core.reporter.netlify_uploader import NetlifyUploader
 
-    # 讀取 Netlify Token
+    # 讀取 Cloudflare API Token
     settings_path = SHOPEE_TOOL_DIR / "config" / "settings.json"
     if not settings_path.exists():
         push("⚠️ 蝦皮廣告報表：找不到工具設定檔。")
         return
     settings = json.loads(settings_path.read_text(encoding="utf-8"))
-    netlify_token = settings.get("netlify_token", "").strip()
+    netlify_token = settings.get("cf_api_token", "").strip()
     if not netlify_token:
-        push("⚠️ 蝦皮廣告報表：尚未設定 Netlify Token，請先在工具中設定。")
+        push("⚠️ 蝦皮廣告報表：尚未設定 Cloudflare API Token，請先在工具中設定。")
         return
 
     # 取得最新一期歷史記錄
@@ -399,9 +399,9 @@ def push_product_perf_report(target: str = "both", period: str = ""):
         push("⚠️ 商品表現報表：找不到工具設定檔。")
         return
     settings = json.loads(settings_path.read_text(encoding="utf-8"))
-    netlify_token = settings.get("netlify_token", "").strip()
+    netlify_token = settings.get("cf_api_token", "").strip()
     if not netlify_token:
-        push("⚠️ 商品表現報表：尚未設定 Netlify Token，請先在工具中設定。")
+        push("⚠️ 商品表現報表：尚未設定 Cloudflare API Token，請先在工具中設定。")
         return
 
     data_dir = SHOPEE_TOOL_DIR / "data"
