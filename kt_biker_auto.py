@@ -117,7 +117,7 @@ def push_shopee_report(target: str = "both"):
 
     log.info(f"生成蝦皮報表 HTML：{latest_period}")
     html = HTMLExporter().generate(analysis_result)
-    url = NetlifyUploader(netlify_token).upload(html)
+    url = NetlifyUploader(netlify_token).upload(html, site_key="shopee_ads")
 
     # 存檔備用
     share_path = data_dir / "latest_share.json"
@@ -493,7 +493,7 @@ def push_product_perf_report(target: str = "both", period: str = ""):
     )
 
     log.info(f"上傳商品表現報表：{latest_period}")
-    url = NetlifyUploader(netlify_token).upload(html)
+    url = NetlifyUploader(netlify_token).upload(html, site_key="product_perf")
 
     share_path = data_dir / "product_perf_latest_share.json"
     share_path.write_text(
