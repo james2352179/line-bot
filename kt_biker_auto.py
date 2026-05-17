@@ -345,8 +345,46 @@ def _product_perf_rule_based(period, kpis, stars, low, cart, rep) -> str:
     )
 
 
-def push_product_perf_report(target: str = "both"):
-    """推播商品表現分析報表（讀 product_perf_history.json 最新期，含圖表）"""
+_CN_MONTHS = {
+    '一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6,
+    '七': 7, '八': 8, '九': 9, '十': 10, '十一': 11, '十二': 12,
+}
+
+def _match_period(query: str, periods: list) -> str | None:
+    """從 periods 清單中找最接近 query 的期間標籤（格式 YYYY年MM月）。"""
+    import re as _re
+    if not query:
+        return None
+    # 完全比對
+    if query in periods:
+        return query
+    # 解析 year
+    year_num = None
+    m = _re.search(r'(\d{4})', query)
+    if m:
+        year_num = int(m.group(1))
+    # 解析 month（中文優先）
+    month_num = None
+    for cn, num in sorted(_CN_MONTHS.items(), key=lambda x: -len(x[0])):
+        if f"{cn}月" in query:
+            month_num = num
+            break
+    if month_num is None:
+        m = _re.search(r'(\d{1,2})月', query)
+        if m:
+            month_num = int(m.group(1))
+    if month_num is None:
+        return None
+    month_str = f"{month_num:02d}月"
+    for p in periods:
+        if month_str in p:
+            if year_num is None or f"{year_num}年" in p:
+                return p
+    return None
+
+
+def push_product_perf_report(target: str = "both", period: str = ""):
+    """推播商品表現分析報表（讀 product_perf_history.json，支援指定月份）"""
     shopee_str = str(SHOPEE_TOOL_DIR)
     if shopee_str not in sys.path:
         sys.path.insert(0, shopee_str)
@@ -373,7 +411,17 @@ def push_product_perf_report(target: str = "both"):
         push("⚠️ 商品表現報表：尚無歷史記錄，請先在工具中分析一期資料。")
         return
 
-    latest_period = periods[0]
+    if period:
+        matched = _match_period(period, periods)
+        if not matched:
+            avail = "、".join(periods[:5])
+            push(f"⚠️ 商品表現報表：找不到「{period}」的紀錄。\n可用期間：{avail}")
+            return
+        latest_period = matched
+        log.info(f"指定期間：{period} → 比對到 {latest_period}")
+    else:
+        latest_period = periods[0]
+
     rec = history.load(latest_period)
     kpis         = rec.get("kpis", {})
     stars        = rec.get("stars")

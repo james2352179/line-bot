@@ -57,6 +57,7 @@ def _run_shopee(params: dict):
 def _run_product_perf(params: dict):
     return _import_auto().push_product_perf_report(
         target=params.get("target", "both"),
+        period=params.get("period", ""),
     )
 
 TASK_HANDLERS = {

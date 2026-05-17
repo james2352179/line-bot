@@ -196,7 +196,8 @@ E. 執行工具（trigger_local）— 判斷 target：
    - 未說明傳給誰 → 改用 ask_target 先問清楚
 
    蝦皮廣告報表 → {"action":"trigger_local","task_name":"shopee_push","target":"..."}
-   商品表現報表 → {"action":"trigger_local","task_name":"product_perf_push","target":"..."}
+   商品表現報表 → {"action":"trigger_local","task_name":"product_perf_push","target":"...","period":"YYYY年MM月（選填，不指定則最新期）"}
+     ※ 若使用者說「四月」→ period:"04月"；說「2026年4月」→ period:"2026年04月"；未指定月份 → 省略 period 欄位
    競品分析 → {"action":"trigger_local","task_name":"competitor_analysis","profile":"客戶名（選填）","target":"..."}
    意圖不明 → {"action":"ask_target","task_name":"...","profile":"（若有）"}
 
@@ -283,10 +284,13 @@ def _do_trigger_local(cmd: dict, user_id: str = None) -> str:
     if not task_name:
         return "❌ 無法識別要執行的工具"
     profile = cmd.get('profile', '').strip()
+    period  = cmd.get('period', '').strip()
     target = cmd.get('target', 'cc_only')
     params = {'target': target}
     if profile:
         params['profile'] = profile
+    if period:
+        params['period'] = period
     if user_id:
         params['reply_to_user_id'] = user_id
     supabase.table('pending_tasks').insert({
