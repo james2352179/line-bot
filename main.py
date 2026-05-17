@@ -193,6 +193,7 @@ D. 修改排程設定
 E. 執行工具（trigger_local）— 判斷 target：
    - 「傳給我」「發給我」「我要看」「傳上來」「給我看」「私下」→ target:"cc_only"
    - 「傳到群組」「推播到員工群」「發到XX群」「傳給員工」→ target:"group"
+   - 「給我以及員工群組」「同時推播」「都要」「兩個都」→ target:"both"（只輸出一個 JSON）
    - 未說明傳給誰 → 改用 ask_target 先問清楚
 
    蝦皮廣告報表 → {"action":"trigger_local","task_name":"shopee_push","target":"..."}
@@ -286,22 +287,28 @@ def _do_trigger_local(cmd: dict, user_id: str = None) -> str:
     profile = cmd.get('profile', '').strip()
     period  = cmd.get('period', '').strip()
     target = cmd.get('target', 'cc_only')
-    params = {'target': target}
-    if profile:
-        params['profile'] = profile
-    if period:
-        params['period'] = period
-    if user_id:
-        params['reply_to_user_id'] = user_id
-    supabase.table('pending_tasks').insert({
-        'task_name': task_name,
-        'status': 'pending',
-        'params': params,
-    }).execute()
+
+    targets = ['cc_only', 'group'] if target == 'both' else [target]
+    for t in targets:
+        params = {'target': t}
+        if profile:
+            params['profile'] = profile
+        if period:
+            params['period'] = period
+        if user_id and t == 'cc_only':
+            params['reply_to_user_id'] = user_id
+        supabase.table('pending_tasks').insert({
+            'task_name': task_name,
+            'status': 'pending',
+            'params': params,
+        }).execute()
+
     task_labels = {'competitor_analysis': '競品戰情室分析', 'shopee_push': '蝦皮廣告報表推播', 'product_perf_push': '商品表現報表推播'}
     label = task_labels.get(task_name, task_name)
     profile_hint = f"（{profile}）" if profile else ""
-    if target == 'cc_only':
+    if target == 'both':
+        return f"✅ 已下達指令：【{label}】{profile_hint}\n完成後會傳回這裡，並同步推播至員工群。\n（請確保 Mac 已開機）"
+    elif target == 'cc_only':
         return f"✅ 已下達指令：【{label}】{profile_hint}\n完成後結果會傳回這裡，不推播員工群。\n（請確保 Mac 已開機）"
     else:
         return f"✅ 已下達指令：【{label}】{profile_hint}\n完成後推播至員工群，同時傳回這裡通知您。\n（請確保 Mac 已開機）"
