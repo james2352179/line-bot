@@ -60,10 +60,13 @@ def _run_product_perf(params: dict):
         period=params.get("period", ""),
     )
 
-TASK_HANDLERS = {
-    "competitor_analysis": _run_competitor,
-    "shopee_push":         _run_shopee,
-    "product_perf_push":   _run_product_perf,
+# 新增客戶時：在此 dict 加一個 key，並在上方實作對應的 _run_xxx 函式
+CLIENT_TASK_HANDLERS = {
+    "kt_biker": {
+        "competitor_analysis": _run_competitor,
+        "shopee_push":         _run_shopee,
+        "product_perf_push":   _run_product_perf,
+    },
 }
 
 # ── 主迴圈 ────────────────────────────────────────────────────────────────────
@@ -90,13 +93,14 @@ def poll_once():
     task_id   = task["id"]
     task_name = task["task_name"]
     params    = task.get("params") or {}
+    client    = params.get("client", "kt_biker")
 
-    log.info(f"收到任務: {task_name} ({task_id[:8]})")
+    log.info(f"收到任務: {client}/{task_name} ({task_id[:8]})")
     _set_status(task_id, "running")
 
-    handler = TASK_HANDLERS.get(task_name)
+    handler = CLIENT_TASK_HANDLERS.get(client, {}).get(task_name)
     if not handler:
-        msg = f"未知任務: {task_name}"
+        msg = f"未知任務或客戶: {client}/{task_name}"
         log.error(msg)
         _set_status(task_id, "error", msg)
         return
@@ -111,7 +115,7 @@ def poll_once():
 
 
 def main():
-    log.info("KT BIKER Daemon 啟動")
+    log.info("多客戶 Daemon 啟動")
     while True:
         try:
             poll_once()

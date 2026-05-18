@@ -35,6 +35,23 @@ cc_config = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 kt_handler = WebhookHandler(KT_CHANNEL_SECRET)
 kt_config = Configuration(access_token=KT_CHANNEL_ACCESS_TOKEN)
 
+# ── 客戶登錄表（新增客戶只需在此加一欄 + Railway 環境變數）────────
+CLIENT_REGISTRY = {
+    'kt_biker': {
+        'display_name': 'KT BIKER',
+        'token_config': kt_config,
+        'group_id': KT_GROUP_ID,
+    },
+    # 'client_a': {
+    #     'display_name': 'Client A',
+    #     'token_config': Configuration(access_token=os.environ.get('CLIENT_A_TOKEN', '')),
+    #     'group_id': os.environ.get('CLIENT_A_GROUP_ID', ''),
+    # },
+}
+
+def _client_cfg(client_id: str) -> dict:
+    return CLIENT_REGISTRY.get(client_id, CLIENT_REGISTRY['kt_biker'])
+
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 MAX_HISTORY_USERS = 50
 histories = {}        # user_id → list[{role,content}]，記憶體快取
@@ -190,17 +207,23 @@ C. 查詢排程（含「查看」「目前」「列出」「排程狀態」）
 D. 修改排程設定
    → {"action":"update_schedule","task_name":"XXX","updates":{只含要改的欄位}}
 
-E. 執行工具（trigger_local）— 判斷 target：
+E. 執行工具（trigger_local）— 判斷 client 與 target：
+
+   【client 判斷】
+   - 「KT BIKER」「KT」「機車配件」或未指定客戶 → client:"kt_biker"
+   - 未來新增客戶會在此補充對應名稱
+
+   【target 判斷】
    - 「傳給我」「發給我」「我要看」「傳上來」「給我看」「私下」→ target:"cc_only"
    - 「傳到群組」「推播到員工群」「發到XX群」「傳給員工」→ target:"group"
    - 「給我以及員工群組」「同時推播」「都要」「兩個都」→ target:"both"（只輸出一個 JSON）
    - 未說明傳給誰 → 改用 ask_target 先問清楚
 
-   蝦皮廣告報表 → {"action":"trigger_local","task_name":"shopee_push","target":"..."}
-   商品表現報表 → {"action":"trigger_local","task_name":"product_perf_push","target":"...","period":"YYYY年MM月（選填，不指定則最新期）"}
+   蝦皮廣告報表 → {"action":"trigger_local","task_name":"shopee_push","client":"kt_biker","target":"..."}
+   商品表現報表 → {"action":"trigger_local","task_name":"product_perf_push","client":"kt_biker","target":"...","period":"YYYY年MM月（選填，不指定則最新期）"}
      ※ 若使用者說「四月」→ period:"04月"；說「2026年4月」→ period:"2026年04月"；未指定月份 → 省略 period 欄位
-   競品分析 → {"action":"trigger_local","task_name":"competitor_analysis","profile":"客戶名（選填）","target":"..."}
-   意圖不明 → {"action":"ask_target","task_name":"...","profile":"（若有）"}
+   競品分析 → {"action":"trigger_local","task_name":"competitor_analysis","client":"kt_biker","profile":"客戶名（選填）","target":"..."}
+   意圖不明 → {"action":"ask_target","task_name":"...","client":"kt_biker","profile":"（若有）"}
 
 F. 推播含 URL → {"action":"push_url","url":"https://...","message":"說明（選填）"}
 
@@ -246,32 +269,37 @@ def execute_command(cmd: dict, user_id: str = None) -> str:
 
     elif action == 'manual_push':
         task_name = cmd['task_name']
+        client = cmd.get('client', 'kt_biker')
         row = supabase.table('bot_schedules').select('*').eq('task_name', task_name).single().execute()
         if not row.data:
             return f"❌ 找不到任務：{task_name}"
         content = (row.data['content']
                    .replace('{date}', datetime.now().strftime("%Y/%m/%d"))
                    .replace('\\n', '\n'))
-        push_to_group(kt_config, KT_GROUP_ID, content)
-        return f"✅ 已手動推播【{row.data['display_name']}】到員工群"
+        cfg = _client_cfg(client)
+        push_to_group(cfg['token_config'], cfg['group_id'], content)
+        return f"✅ 已手動推播【{row.data['display_name']}】到{cfg['display_name']}員工群"
 
     elif action == 'push_url':
         url = cmd.get('url', '').strip()
         msg = cmd.get('message', '').strip()
+        client = cmd.get('client', 'kt_biker')
         if not url:
             return "❌ 沒有偵測到網址"
         content = f"{msg}\n{url}" if msg else url
-        push_to_group(kt_config, KT_GROUP_ID, content)
-        return "✅ 已推播連結到員工群"
+        cfg = _client_cfg(client)
+        push_to_group(cfg['token_config'], cfg['group_id'], content)
+        return f"✅ 已推播連結到{cfg['display_name']}員工群"
 
     elif action == 'trigger_local':
         return _do_trigger_local(cmd, user_id)
 
     elif action == 'ask_target':
         task_name = cmd.get('task_name', '')
+        client = cmd.get('client', 'kt_biker')
         profile = cmd.get('profile', '').strip()
         if user_id:
-            pending_actions[user_id] = ({'task_name': task_name, 'profile': profile}, datetime.now())
+            pending_actions[user_id] = ({'task_name': task_name, 'client': client, 'profile': profile}, datetime.now())
         task_labels = {'competitor_analysis': '競品分析', 'shopee_push': '蝦皮廣告報表', 'product_perf_push': '商品表現報表'}
         label = task_labels.get(task_name, task_name)
         profile_hint = f"「{profile}」的" if profile else ""
@@ -284,13 +312,14 @@ def _do_trigger_local(cmd: dict, user_id: str = None) -> str:
     task_name = cmd.get('task_name', '')
     if not task_name:
         return "❌ 無法識別要執行的工具"
+    client  = cmd.get('client', 'kt_biker')
     profile = cmd.get('profile', '').strip()
     period  = cmd.get('period', '').strip()
-    target = cmd.get('target', 'cc_only')
+    target  = cmd.get('target', 'cc_only')
 
     targets = ['cc_only', 'group'] if target == 'both' else [target]
     for t in targets:
-        params = {'target': t}
+        params = {'client': client, 'target': t}
         if profile:
             params['profile'] = profile
         if period:
@@ -303,15 +332,17 @@ def _do_trigger_local(cmd: dict, user_id: str = None) -> str:
             'params': params,
         }).execute()
 
+    cfg = _client_cfg(client)
     task_labels = {'competitor_analysis': '競品戰情室分析', 'shopee_push': '蝦皮廣告報表推播', 'product_perf_push': '商品表現報表推播'}
     label = task_labels.get(task_name, task_name)
+    client_hint = f"【{cfg['display_name']}】" if client != 'kt_biker' else ""
     profile_hint = f"（{profile}）" if profile else ""
     if target == 'both':
-        return f"✅ 已下達指令：【{label}】{profile_hint}\n完成後會傳回這裡，並同步推播至員工群。\n（請確保 Mac 已開機）"
+        return f"✅ 已下達指令：{client_hint}【{label}】{profile_hint}\n完成後會傳回這裡，並同步推播至員工群。\n（請確保 Mac 已開機）"
     elif target == 'cc_only':
-        return f"✅ 已下達指令：【{label}】{profile_hint}\n完成後結果會傳回這裡，不推播員工群。\n（請確保 Mac 已開機）"
+        return f"✅ 已下達指令：{client_hint}【{label}】{profile_hint}\n完成後結果會傳回這裡，不推播員工群。\n（請確保 Mac 已開機）"
     else:
-        return f"✅ 已下達指令：【{label}】{profile_hint}\n完成後推播至員工群，同時傳回這裡通知您。\n（請確保 Mac 已開機）"
+        return f"✅ 已下達指令：{client_hint}【{label}】{profile_hint}\n完成後推播至員工群，同時傳回這裡通知您。\n（請確保 Mac 已開機）"
 
 
 def resolve_pending_action(pending: dict, response: str, user_id: str) -> str:

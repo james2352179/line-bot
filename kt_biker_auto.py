@@ -80,7 +80,7 @@ def push_shopee_report(target: str = "both"):
 
     from core.storage.history_store import HistoryStore
     from core.reporter.html_exporter import HTMLExporter
-    from core.reporter.netlify_uploader import NetlifyUploader
+    from core.reporter.cf_pages_uploader import PagesUploader
 
     # 讀取 Cloudflare API Token
     settings_path = SHOPEE_TOOL_DIR / "config" / "settings.json"
@@ -88,8 +88,8 @@ def push_shopee_report(target: str = "both"):
         push("⚠️ 蝦皮廣告報表：找不到工具設定檔。")
         return
     settings = json.loads(settings_path.read_text(encoding="utf-8"))
-    netlify_token = settings.get("cf_api_token", "").strip()
-    if not netlify_token:
+    cf_token = settings.get("cf_api_token", "").strip()
+    if not cf_token:
         push("⚠️ 蝦皮廣告報表：尚未設定 Cloudflare API Token，請先在工具中設定。")
         return
 
@@ -117,7 +117,7 @@ def push_shopee_report(target: str = "both"):
 
     log.info(f"生成蝦皮報表 HTML：{latest_period}")
     html = HTMLExporter().generate(analysis_result)
-    url = NetlifyUploader(netlify_token).upload(html, site_key="shopee_ads")
+    url = PagesUploader(cf_token).upload(html, site_key="shopee_ads")
 
     # 存檔備用
     share_path = data_dir / "latest_share.json"
@@ -177,26 +177,44 @@ def _start_webapp():
 
 
 def _run_analysis_and_wait():
-    """觸發全平台分析，等待 SSE done 事件，最多等 90 分鐘。"""
+    """觸發全平台分析，等待 SSE done 事件，最多等 90 分鐘。
+    若分析已在進行中（409），改為輪詢 /status 等待結束。
+    """
     log.info("開始全平台分析…")
-    with requests.get(f"{COMPETITOR_URL}/api/analysis/all/run", stream=True, timeout=5400) as r:
-        r.raise_for_status()
-        for raw in r.iter_lines(decode_unicode=True):
-            if not raw or not raw.startswith("data:"):
-                continue
+    r = requests.get(f"{COMPETITOR_URL}/api/analysis/all/run", stream=True, timeout=5400)
+
+    if r.status_code == 409:
+        log.info("分析已在進行中，等待現有分析完成…")
+        deadline = time.time() + 5400
+        while time.time() < deadline:
             try:
-                event = json.loads(raw[5:].strip())
+                st = requests.get(f"{COMPETITOR_URL}/api/analysis/all/status", timeout=10).json()
+                if not st.get("running"):
+                    log.info("分析完成（等待現有執行結束）")
+                    return True
             except Exception:
-                continue
-            kind = event.get("kind", "")
-            if kind == "done":
-                log.info("分析完成")
-                return True
-            if kind == "error":
-                log.error(f"分析失敗: {event.get('payload')}")
-                return False
-            if kind not in ("heartbeat", "progress"):
-                log.info(f"[{kind}] {str(event.get('payload', ''))[:80]}")
+                pass
+            time.sleep(30)
+        log.error("等待現有分析超時（90 分鐘）")
+        return False
+
+    r.raise_for_status()
+    for raw in r.iter_lines(decode_unicode=True):
+        if not raw or not raw.startswith("data:"):
+            continue
+        try:
+            event = json.loads(raw[5:].strip())
+        except Exception:
+            continue
+        kind = event.get("kind", "")
+        if kind == "done":
+            log.info("分析完成")
+            return True
+        if kind == "error":
+            log.error(f"分析失敗: {event.get('payload')}")
+            return False
+        if kind not in ("heartbeat", "progress"):
+            log.info(f"[{kind}] {str(event.get('payload', ''))[:80]}")
     return False
 
 
@@ -229,7 +247,7 @@ def push_competitor_report(profile_keyword: str | None = None, target: str = "bo
         push("⚠️ 競品分析執行失敗，請手動檢查。")
         return None
 
-    # 發布到 Netlify（最多重試 2 次，失敗平台單獨補發）
+    # 發布到 Cloudflare Pages（最多重試 2 次，失敗平台單獨補發）
     platform_names = {
         "youtube": "YouTube", "tiktok": "TikTok",
         "facebook": "Facebook", "instagram": "Instagram", "threads": "Threads",
@@ -392,15 +410,15 @@ def push_product_perf_report(target: str = "both", period: str = ""):
     from core.storage.product_perf_history import ProductPerfHistory
     from core.reporter import product_performance_exporter as pex
     from core.reporter import product_performance_charts as pcharts
-    from core.reporter.netlify_uploader import NetlifyUploader
+    from core.reporter.cf_pages_uploader import PagesUploader
 
     settings_path = SHOPEE_TOOL_DIR / "config" / "settings.json"
     if not settings_path.exists():
         push("⚠️ 商品表現報表：找不到工具設定檔。")
         return
     settings = json.loads(settings_path.read_text(encoding="utf-8"))
-    netlify_token = settings.get("cf_api_token", "").strip()
-    if not netlify_token:
+    cf_token = settings.get("cf_api_token", "").strip()
+    if not cf_token:
         push("⚠️ 商品表現報表：尚未設定 Cloudflare API Token，請先在工具中設定。")
         return
 
@@ -493,7 +511,7 @@ def push_product_perf_report(target: str = "both", period: str = ""):
     )
 
     log.info(f"上傳商品表現報表：{latest_period}")
-    url = NetlifyUploader(netlify_token).upload(html, site_key="product_perf")
+    url = PagesUploader(cf_token).upload(html, site_key="product_perf")
 
     share_path = data_dir / "product_perf_latest_share.json"
     share_path.write_text(
