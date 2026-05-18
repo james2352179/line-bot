@@ -578,41 +578,71 @@ def push_product_perf_report(target: str = "both", period: str = ""):
     if api_key:
         try:
             import anthropic
-            ctx_lines = [f"【期間】{latest_period}", ""]
-            total = kpis.get("total_revenue", 0)
-            ctx_lines += [
-                f"- 總銷售額：${total:,.0f} TWD",
-                f"- 商品數：{int(kpis.get('product_count',0))} 件",
-                f"- 平均轉換率：{kpis.get('avg_cvr',0):.1f}%",
-                f"- 平均回購率：{kpis.get('avg_repurchase',0):.1f}%",
-            ]
-            if stars is not None and not stars.empty and "累積佔比" in stars.columns:
-                ctx_lines.append(f"- 80/20集中度：前 {int((stars['累積佔比']<=80).sum())} 件商品貢獻80%銷售")
-            prompt = "\n".join(ctx_lines) + """
 
-你是蝦皮商品數據分析師。根據上述數據，用繁體中文輸出極簡決策摘要。
-【輸出規則】每bullet不超過20字，含具體數字；總字數180字以內；嚴格按格式：
+            def _rows(df, cols, n=5):
+                if df is None or df.empty:
+                    return ["  （無資料）"]
+                out = []
+                for _, r in df.head(n).iterrows():
+                    out.append("  " + " | ".join(
+                        f"{c}: {r.get(c, '')}" for c in cols if c in r
+                    ))
+                return out
+
+            total = kpis.get("total_revenue", 0)
+            to80 = int((stars["累積佔比"] <= 80).sum()) if (stars is not None and not stars.empty and "累積佔比" in stars.columns) else "—"
+            ctx_lines = [
+                f"【期間】{latest_period}", "",
+                "【整體 KPI】",
+                f"- 總銷售額：${total:,.0f} TWD",
+                f"- 商品數：{int(kpis.get('product_count', 0))} 件",
+                f"- 平均轉換率：{kpis.get('avg_cvr', 0):.1f}%",
+                f"- 平均回購率：{kpis.get('avg_repurchase', 0):.1f}%",
+                f"- 80/20集中度：前 {to80} 件商品貢獻80%銷售", "",
+                "【銷售前5名（銷售明星）】",
+                *_rows(stars, ["商品名稱", "銷售額", "訂單_num", "轉換率_num", "累積佔比"]), "",
+                "【高曝光低轉換（前5名）】",
+                *_rows(low_cvr, ["商品名稱", "曝光", "轉換率_num", "加購率_num", "跳出率_num"]), "",
+                "【棄單警告（前5名）】",
+                *_rows(cart_abandon, ["商品名稱", "加購數", "購→訂率", "銷售額"]), "",
+                "【高回購品（前5名）】",
+                *_rows(repurchase, ["商品名稱", "回購率_num", "回購天數_num"]),
+            ]
+            ctx = "\n".join(ctx_lines)
+
+            prompt = f"""你是蝦皮電商分析師，幫業主生成一份「決策摘要」。業主看完後要能馬上知道「哪幾個商品有問題」以及「該怎麼做」。
+
+{ctx}
+
+【強制規則】
+1. 每個 bullet 必須點名「具體商品名稱」——取上方資料的真實名稱，截短至15字內的核心關鍵詞（去掉規格、符號等雜訊）
+2. 嚴格禁止空泛描述，例如「長尾商品」「頭部商品」「某些商品」「明星商品」
+3. 沒有商品名的 bullet = 廢話，不要寫
+4. 總字數 230 字以內，不得增減區塊
+
+--- 輸出格式 ---
 
 🌟 本期概況
-• [月銷售額 $XXX萬 / X件商品 / 轉換率X%]
-• [前X件明星商品貢獻80%銷售]
+• 銷售額 $X萬 ／ X件有銷售商品 ／ 前X件撐起80%營收
+• 平均轉換率 X% ／ 平均回購率 X%
 
-✅ 優勢
-• [最強商品名：金額]
-• [最高回購商品名：回購率X%]
+✅ 表現最佳
+• 【商品名A】：銷售額 $X萬，轉換率 X%
+• 【商品名B】：回購率 X%，每 X 天回購
 
-⚠️ 警示
-• [最嚴重棄單商品名：購→訂X%]
-• [最嚴重低轉換商品名：曝光X萬 → 轉換X%]
+⚠️ 需要立即處理（最嚴重的 2–3 個）
+• 【商品名C】：加購 X 次但購→訂率 X%（棄單原因：[競品更低價 or 運費門檻 or 評價不足]）
+• 【商品名D】：曝光 X 萬但轉換率 X%（建議：[換主圖 or 調標題 or 降價]）
 
-🎯 行動（3條，每條15字內）
-1. 立即：[具體動作+商品名]
-2. 本週：[具體動作]
-3. 長期：[具體動作]"""
+🎯 本週行動
+1. 【商品名C】降 $X 元或設滿額折扣，目標購→訂率到 X%
+2. 【商品名D】更換主圖，參考【商品名A】的版面風格
+3. 【商品名B】推舊客優先通知 or 訂閱優惠，鞏固回購週期"""
+
             client = anthropic.Anthropic(api_key=api_key)
             msg = client.messages.create(
                 model=settings.get("model", "claude-sonnet-4-6"),
-                max_tokens=600,
+                max_tokens=800,
                 messages=[{"role": "user", "content": prompt}],
             )
             ai_text = msg.content[0].text
