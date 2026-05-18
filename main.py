@@ -133,7 +133,14 @@ def notify_completed_tasks():
             status = task.get('status', 'done')
             result = (task.get('result') or '').strip()
             task_name = task.get('task_name', '')
-            labels = {'competitor_analysis': '競品分析', 'shopee_push': '蝦皮廣告報表', 'product_perf_push': '商品表現報表'}
+            labels = {
+                'competitor_analysis':      '競品分析',
+                'shopee_push':              '蝦皮廣告報表',
+                'product_perf_push':        '商品表現報表',
+                'competitor_status':        '競品分析狀態',
+                'single_platform_analysis': '單平台競品分析',
+                'latest_platform_report':   '最新競品報告',
+            }
             label = labels.get(task_name, task_name)
             if status == 'error':
                 lines = [f"❌ 【{label}】執行失敗", '', result or '（無錯誤訊息）']
@@ -227,9 +234,21 @@ E. 執行工具（trigger_local）— 判斷 client 與 target：
 
 F. 推播含 URL → {"action":"push_url","url":"https://...","message":"說明（選填）"}
 
+G. 查詢競品分析狀態（含「跑完了嗎」「分析進行中嗎」「狀態」）
+   → {"action":"trigger_local","task_name":"competitor_status","client":"kt_biker","target":"cc_only"}
+
+H. 單平台競品分析（含「只跑」「只分析」+平台名，節省時間）
+   平台對應：YouTube/YT → youtube；TikTok/抖音 → tiktok；Facebook/FB → facebook；Instagram/IG → instagram；Threads → threads
+   → {"action":"trigger_local","task_name":"single_platform_analysis","client":"kt_biker","platform":"youtube","target":"..."}
+
+I. 取最新報告連結（含「上次的」「最新的」「不重跑」「重新發布」+平台名）
+   預設只傳給我（cc_only），不推員工群
+   → {"action":"trigger_local","task_name":"latest_platform_report","client":"kt_biker","platform":"youtube","target":"cc_only"}
+
 【可用任務】
 排程控制：biweekly_report（競品）、monthly_shopee（蝦皮）
 本地工具：competitor_analysis、shopee_push、product_perf_push（商品表現）
+         competitor_status（查詢狀態）、single_platform_analysis（單平台，需 platform）、latest_platform_report（最新連結，需 platform）
 
 【對話記憶使用原則】
 - 若前幾則訊息已討論過某任務，新指令直接引用（如「改成傳到群組」指前一個任務）
@@ -297,10 +316,18 @@ def execute_command(cmd: dict, user_id: str = None) -> str:
     elif action == 'ask_target':
         task_name = cmd.get('task_name', '')
         client = cmd.get('client', 'kt_biker')
+        platform = cmd.get('platform', '')
         profile = cmd.get('profile', '').strip()
         if user_id:
-            pending_actions[user_id] = ({'task_name': task_name, 'client': client, 'profile': profile}, datetime.now())
-        task_labels = {'competitor_analysis': '競品分析', 'shopee_push': '蝦皮廣告報表', 'product_perf_push': '商品表現報表'}
+            pending_actions[user_id] = ({'task_name': task_name, 'client': client, 'platform': platform, 'profile': profile}, datetime.now())
+        task_labels = {
+            'competitor_analysis':      '競品分析',
+            'shopee_push':              '蝦皮廣告報表',
+            'product_perf_push':        '商品表現報表',
+            'competitor_status':        '競品分析狀態',
+            'single_platform_analysis': '單平台競品分析',
+            'latest_platform_report':   '最新競品報告',
+        }
         label = task_labels.get(task_name, task_name)
         profile_hint = f"「{profile}」的" if profile else ""
         return f"請問您要把{profile_hint}【{label}】：\n\n1️⃣ 傳給我個人查看\n2️⃣ 推播到員工群組\n\n回覆「給我」或「推播到群組」即可。"
@@ -312,14 +339,17 @@ def _do_trigger_local(cmd: dict, user_id: str = None) -> str:
     task_name = cmd.get('task_name', '')
     if not task_name:
         return "❌ 無法識別要執行的工具"
-    client  = cmd.get('client', 'kt_biker')
-    profile = cmd.get('profile', '').strip()
-    period  = cmd.get('period', '').strip()
-    target  = cmd.get('target', 'cc_only')
+    client   = cmd.get('client', 'kt_biker')
+    platform = cmd.get('platform', '').strip()
+    profile  = cmd.get('profile', '').strip()
+    period   = cmd.get('period', '').strip()
+    target   = cmd.get('target', 'cc_only')
 
     targets = ['cc_only', 'group'] if target == 'both' else [target]
     for t in targets:
         params = {'client': client, 'target': t}
+        if platform:
+            params['platform'] = platform
         if profile:
             params['profile'] = profile
         if period:
@@ -333,16 +363,25 @@ def _do_trigger_local(cmd: dict, user_id: str = None) -> str:
         }).execute()
 
     cfg = _client_cfg(client)
-    task_labels = {'competitor_analysis': '競品戰情室分析', 'shopee_push': '蝦皮廣告報表推播', 'product_perf_push': '商品表現報表推播'}
+    task_labels = {
+        'competitor_analysis':      '競品戰情室分析',
+        'shopee_push':              '蝦皮廣告報表推播',
+        'product_perf_push':        '商品表現報表推播',
+        'competitor_status':        '競品分析狀態查詢',
+        'single_platform_analysis': '單平台競品分析',
+        'latest_platform_report':   '最新競品報告',
+    }
     label = task_labels.get(task_name, task_name)
     client_hint = f"【{cfg['display_name']}】" if client != 'kt_biker' else ""
+    platform_hint = f"（{platform.upper()}）" if platform else ""
     profile_hint = f"（{profile}）" if profile else ""
+    hint = f"{platform_hint}{profile_hint}"
     if target == 'both':
-        return f"✅ 已下達指令：{client_hint}【{label}】{profile_hint}\n完成後會傳回這裡，並同步推播至員工群。\n（請確保 Mac 已開機）"
+        return f"✅ 已下達指令：{client_hint}【{label}】{hint}\n完成後會傳回這裡，並同步推播至員工群。\n（請確保 Mac 已開機）"
     elif target == 'cc_only':
-        return f"✅ 已下達指令：{client_hint}【{label}】{profile_hint}\n完成後結果會傳回這裡，不推播員工群。\n（請確保 Mac 已開機）"
+        return f"✅ 已下達指令：{client_hint}【{label}】{hint}\n完成後結果會傳回這裡，不推播員工群。\n（請確保 Mac 已開機）"
     else:
-        return f"✅ 已下達指令：{client_hint}【{label}】{profile_hint}\n完成後推播至員工群，同時傳回這裡通知您。\n（請確保 Mac 已開機）"
+        return f"✅ 已下達指令：{client_hint}【{label}】{hint}\n完成後推播至員工群，同時傳回這裡通知您。\n（請確保 Mac 已開機）"
 
 
 def resolve_pending_action(pending: dict, response: str, user_id: str) -> str:

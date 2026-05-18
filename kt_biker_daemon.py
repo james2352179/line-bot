@@ -60,12 +60,30 @@ def _run_product_perf(params: dict):
         period=params.get("period", ""),
     )
 
+def _run_competitor_status(params: dict):
+    return _import_auto().query_competitor_status()
+
+def _run_single_platform(params: dict):
+    return _import_auto().run_single_platform_report(
+        platform=params.get("platform", ""),
+        target=params.get("target", "both"),
+    )
+
+def _run_latest_platform(params: dict):
+    return _import_auto().get_latest_platform_report(
+        platform=params.get("platform", ""),
+        target=params.get("target", "cc_only"),
+    )
+
 # 新增客戶時：在此 dict 加一個 key，並在上方實作對應的 _run_xxx 函式
 CLIENT_TASK_HANDLERS = {
     "kt_biker": {
-        "competitor_analysis": _run_competitor,
-        "shopee_push":         _run_shopee,
-        "product_perf_push":   _run_product_perf,
+        "competitor_analysis":      _run_competitor,
+        "shopee_push":              _run_shopee,
+        "product_perf_push":        _run_product_perf,
+        "competitor_status":        _run_competitor_status,
+        "single_platform_analysis": _run_single_platform,
+        "latest_platform_report":   _run_latest_platform,
     },
 }
 

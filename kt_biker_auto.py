@@ -307,6 +307,121 @@ def push_competitor_report(profile_keyword: str | None = None, target: str = "bo
     return message
 
 
+# ── 競品戰情室進階指令 ────────────────────────────────────────────────────────
+
+PLATFORM_NAMES = {
+    "youtube": "YouTube", "tiktok": "TikTok",
+    "facebook": "Facebook", "instagram": "Instagram", "threads": "Threads",
+}
+
+
+def query_competitor_status() -> str:
+    """查詢競品戰情室目前是否有分析在執行"""
+    if not _webapp_ready():
+        return "競品戰情室尚未啟動，無法查詢狀態。"
+    try:
+        st = requests.get(f"{COMPETITOR_URL}/api/analysis/all/status", timeout=10).json()
+        if st.get("running"):
+            return "⏳ 目前有競品分析正在執行中，請稍候。"
+        return "✅ 目前沒有分析在執行，可以下達新的分析指令。"
+    except Exception as e:
+        return f"⚠️ 無法取得分析狀態：{e}"
+
+
+def _run_platform_and_wait(platform: str) -> bool:
+    """觸發單一平台分析並等待完成（SSE + 409 fallback）"""
+    log.info(f"開始 {platform} 平台分析…")
+    r = requests.get(f"{COMPETITOR_URL}/api/analysis/{platform}/run", stream=True, timeout=5400)
+    if r.status_code == 409:
+        log.info(f"{platform} 分析已在進行中，輪詢等待…")
+        deadline = time.time() + 5400
+        while time.time() < deadline:
+            try:
+                st = requests.get(f"{COMPETITOR_URL}/api/analysis/{platform}/status", timeout=10).json()
+                if not st.get("running"):
+                    return True
+            except Exception:
+                pass
+            time.sleep(30)
+        return False
+    r.raise_for_status()
+    for raw in r.iter_lines(decode_unicode=True):
+        if not raw or not raw.startswith("data:"):
+            continue
+        try:
+            event = json.loads(raw[5:].strip())
+        except Exception:
+            continue
+        kind = event.get("kind", "")
+        if kind == "done":
+            log.info(f"{platform} 分析完成")
+            return True
+        if kind == "error":
+            log.error(f"{platform} 分析失敗: {event.get('payload')}")
+            return False
+    return False
+
+
+def _publish_platform(platform: str) -> str | None:
+    """發布單一平台已分析的報告到 CF Pages，回傳 URL；失敗回傳 None"""
+    try:
+        r = requests.post(f"{COMPETITOR_URL}/api/analysis/{platform}/publish", timeout=120)
+        d = r.json()
+        if d.get("ok") and d.get("url"):
+            return d["url"]
+        log.warning(f"{platform} 發布失敗: {d}")
+    except Exception as e:
+        log.error(f"{platform} 發布例外: {e}")
+    return None
+
+
+def run_single_platform_report(platform: str, target: str = "both") -> str | None:
+    """跑單一平台競品分析並推播報告"""
+    if platform not in PLATFORM_NAMES:
+        return f"⚠️ 不支援的平台：{platform}"
+    if not _webapp_ready():
+        if not _start_webapp():
+            return "⚠️ 競品戰情室啟動逾時，請手動執行。"
+    label = PLATFORM_NAMES[platform]
+    if not _run_platform_and_wait(platform):
+        msg = f"⚠️ {label} 競品分析執行失敗，請手動檢查。"
+        if target != "cc_only":
+            push(msg)
+        return msg
+    url = _publish_platform(platform)
+    if not url:
+        msg = f"⚠️ {label} 報告發布失敗，請手動檢查。"
+        if target != "cc_only":
+            push(msg)
+        return msg
+    message = f"📈 {label} 競品分析報表\n{url}"
+    if target != "cc_only":
+        push(message)
+    log.info(f"{label} 單平台分析完成: {url}（target={target}）")
+    return message
+
+
+def get_latest_platform_report(platform: str, target: str = "cc_only") -> str | None:
+    """重新發布上次已分析的平台報告（不重跑分析）"""
+    if platform not in PLATFORM_NAMES:
+        return f"⚠️ 不支援的平台：{platform}"
+    if not _webapp_ready():
+        if not _start_webapp():
+            return "⚠️ 競品戰情室啟動逾時，請手動執行。"
+    label = PLATFORM_NAMES[platform]
+    url = _publish_platform(platform)
+    if not url:
+        msg = f"⚠️ {label} 尚無可發布的報告，請先執行分析。"
+        if target != "cc_only":
+            push(msg)
+        return msg
+    message = f"📈 {label} 最新競品報告（上次分析結果）\n{url}"
+    if target != "cc_only":
+        push(message)
+    log.info(f"{label} 最新報告推播: {url}（target={target}）")
+    return message
+
+
 # ── 商品表現報表推播 ───────────────────────────────────────────────────────────
 
 def _short_name(raw: str, maxlen: int = 14) -> str:
