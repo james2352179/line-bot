@@ -194,10 +194,18 @@ def apply_schedule_update(task_name, updates: dict) -> str:
         updates.setdefault('schedule_day', updates.pop('day'))
 
     updates['updated_at'] = datetime.now().isoformat()
-    # 用 upsert 支援新增不存在的任務
-    if 'task_name' not in updates:
+    # 先嘗試 update；若無此 row（新任務）則 insert
+    result = supabase.table('bot_schedules').update(updates).eq('task_name', task_name).execute()
+    if not result.data:
         updates['task_name'] = task_name
-    supabase.table('bot_schedules').upsert(updates, on_conflict='task_name').execute()
+        updates.setdefault('display_name', task_name)
+        updates.setdefault('enabled', True)
+        updates.setdefault('schedule_day', 1)
+        updates.setdefault('schedule_hour', 9)
+        updates.setdefault('schedule_minute', 0)
+        updates.setdefault('content', '')
+        supabase.table('bot_schedules').insert(updates).execute()
+        logger.info(f"新排程任務已建立: {task_name}")
     row = supabase.table('bot_schedules').select('*').eq('task_name', task_name).single().execute()
     job = row.data
     if scheduler.get_job(task_name):
