@@ -402,19 +402,59 @@ def run_single_platform_report(platform: str, target: str = "both") -> str | Non
 
 
 def get_latest_platform_report(platform: str, target: str = "cc_only") -> str | None:
-    """重新發布上次已分析的平台報告（不重跑分析）"""
+    """重新發布上次已分析的平台報告（直接讀本地 HTML，不需要啟動 webapp）"""
     if platform not in PLATFORM_NAMES:
         return f"⚠️ 不支援的平台：{platform}"
-    if not _webapp_ready():
-        if not _start_webapp():
-            return "⚠️ 競品戰情室啟動逾時，請手動執行。"
-    label = PLATFORM_NAMES[platform]
-    url = _publish_platform(platform)
-    if not url:
-        msg = f"⚠️ {label} 尚無可發布的報告，請先執行分析。"
+
+    # 各平台報告目錄與 CF Pages site_key（與 webapp app.py 保持一致）
+    REPORT_DIRS = {
+        "youtube":   COMPETITOR_DIR / "reports",
+        "tiktok":    COMPETITOR_DIR / "tiktok_reports",
+        "facebook":  COMPETITOR_DIR / "fb_reports",
+        "instagram": COMPETITOR_DIR / "ig_reports",
+        "threads":   COMPETITOR_DIR / "threads_reports",
+    }
+    SITE_KEYS = {
+        "youtube":   "competitor-yt",
+        "tiktok":    "competitor-tt",
+        "facebook":  "competitor-fb",
+        "instagram": "competitor-ig",
+        "threads":   "competitor-th",
+    }
+
+    label    = PLATFORM_NAMES[platform]
+    rep_dir  = REPORT_DIRS[platform]
+    site_key = SITE_KEYS[platform]
+
+    # 找最新 HTML 報告（按 mtime 排序）
+    from pathlib import Path as _Path
+    reports = sorted(_Path(rep_dir).glob("*.html"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not reports:
+        msg = f"⚠️ {label} 本地尚無報告，請先執行分析。"
         if target != "cc_only":
             push(msg)
         return msg
+
+    # 讀取 CF API Token（從蝦皮工具 settings.json 共用）
+    shopee_settings = SHOPEE_TOOL_DIR / "config" / "settings.json"
+    cf_token = ""
+    if shopee_settings.exists():
+        cf_token = json.loads(shopee_settings.read_text(encoding="utf-8")).get("cf_api_token", "").strip()
+    if not cf_token:
+        msg = f"⚠️ 尚未設定 Cloudflare API Token，請先在蝦皮工具設定頁填入。"
+        if target != "cc_only":
+            push(msg)
+        return msg
+
+    # 直接上傳到 CF Pages，完全不需要啟動 webapp
+    shopee_str = str(SHOPEE_TOOL_DIR)
+    if shopee_str not in sys.path:
+        sys.path.insert(0, shopee_str)
+    from core.reporter.cf_pages_uploader import PagesUploader
+
+    html = reports[0].read_text(encoding="utf-8")
+    url  = PagesUploader(cf_token).upload(html, site_key=site_key)
+
     message = f"📈 {label} 最新競品報告（上次分析結果）\n{url}"
     if target != "cc_only":
         push(message)
