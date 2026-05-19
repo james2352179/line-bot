@@ -143,6 +143,7 @@ def notify_completed_tasks():
                 'single_platform_analysis': '單平台競品分析',
                 'latest_platform_report':   '最新競品報告',
                 'code_repair':              '程式碼修復',
+                'short_video_push':         '蝦皮短影音報表',
             }
             label = labels.get(task_name, task_name)
             if status == 'error':
@@ -385,6 +386,7 @@ def execute_command(cmd: dict, user_id: str = None) -> str:
             'competitor_status':        '競品分析狀態',
             'single_platform_analysis': '單平台競品分析',
             'latest_platform_report':   '最新競品報告',
+            'short_video_push':         '蝦皮短影音報表',
         }
         label = task_labels.get(task_name, task_name)
         profile_hint = f"「{profile}」的" if profile else ""
@@ -428,6 +430,7 @@ def _do_trigger_local(cmd: dict, user_id: str = None) -> str:
         'competitor_status':        '競品分析狀態查詢',
         'single_platform_analysis': '單平台競品分析',
         'latest_platform_report':   '最新競品報告',
+        'short_video_push':         '蝦皮短影音報表推播',
     }
     label = task_labels.get(task_name, task_name)
     client_hint = f"【{cfg['display_name']}】" if client != 'kt_biker' else ""
