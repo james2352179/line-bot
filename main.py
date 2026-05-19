@@ -183,8 +183,21 @@ def load_and_schedule_all():
         scheduler.add_job(notify_completed_tasks, 'interval', id='notify_completed', seconds=60)
 
 def apply_schedule_update(task_name, updates: dict) -> str:
+    # 相容處理：CC 可能輸出 hour/minute 分開或合併的 time 字串
+    if 'time' in updates:
+        t = updates.pop('time')
+        if isinstance(t, str) and ':' in t:
+            h, m = t.split(':', 1)
+            updates.setdefault('schedule_hour', int(h))
+            updates.setdefault('schedule_minute', int(m))
+    if 'day' in updates:
+        updates.setdefault('schedule_day', updates.pop('day'))
+
     updates['updated_at'] = datetime.now().isoformat()
-    supabase.table('bot_schedules').update(updates).eq('task_name', task_name).execute()
+    # 用 upsert 支援新增不存在的任務
+    if 'task_name' not in updates:
+        updates['task_name'] = task_name
+    supabase.table('bot_schedules').upsert(updates, on_conflict='task_name').execute()
     row = supabase.table('bot_schedules').select('*').eq('task_name', task_name).single().execute()
     job = row.data
     if scheduler.get_job(task_name):
@@ -222,6 +235,13 @@ C. 查詢排程（含「查看」「目前」「列出」「排程狀態」）
 
 D. 修改排程設定
    → {"action":"update_schedule","task_name":"XXX","updates":{只含要改的欄位}}
+   欄位名稱對照（務必使用這些名稱，不可自創）：
+   - 日期 → "schedule_day": 數字（例：3）
+   - 時間 → "schedule_hour": 數字, "schedule_minute": 數字（例："schedule_hour":9,"schedule_minute":30）
+   - 啟用狀態 → "enabled": true/false
+   - 內容 → "content": "訊息文字"
+   - 顯示名稱 → "display_name": "名稱"
+   新增不存在的任務也用 update_schedule，系統會自動建立
 
 E. 執行工具（trigger_local）— 判斷 client 與 target：
 
