@@ -22,6 +22,8 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()],
 )
 log = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # ── Supabase ──────────────────────────────────────────────────────────────────
 supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
@@ -58,6 +60,11 @@ def _run_product_perf(params: dict):
     return _import_auto().push_product_perf_report(
         target=params.get("target", "both"),
         period=params.get("period", ""),
+    )
+
+def _run_short_video(params: dict):
+    return _import_auto().push_short_video_report(
+        target=params.get("target", "both"),
     )
 
 def _run_code_repair(params: dict) -> str:
@@ -199,6 +206,7 @@ CLIENT_TASK_HANDLERS = {
         "competitor_analysis":      _run_competitor,
         "shopee_push":              _run_shopee,
         "product_perf_push":        _run_product_perf,
+        "short_video_push":         _run_short_video,
         "code_repair":              _run_code_repair,
         "competitor_status":        _run_competitor_status,
         "single_platform_analysis": _run_single_platform,

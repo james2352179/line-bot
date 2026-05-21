@@ -25,6 +25,8 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # ── 設定 ──────────────────────────────────────────────────────────────────────
 
@@ -134,6 +136,177 @@ def push_shopee_report(target: str = "both"):
         log.info(f"蝦皮報表已推播: {latest_period} {url}（→員工群）")
     else:
         log.info(f"蝦皮報表完成: {latest_period} {url}（僅回傳 CC）")
+    return message
+
+
+# ── 短影音報表推播（月5號） ──────────────────────────────────────────────────────
+
+def push_short_video_report(target: str = "both"):
+    import pandas as pd
+
+    shopee_str = str(SHOPEE_TOOL_DIR)
+    if shopee_str not in sys.path:
+        sys.path.insert(0, shopee_str)
+
+    from core.reporter.short_video_exporter import generate
+    from core.reporter.cf_pages_uploader import PagesUploader
+
+    settings_path = SHOPEE_TOOL_DIR / "config" / "settings.json"
+    if not settings_path.exists():
+        push("⚠️ 短影音報表：找不到工具設定檔。")
+        return
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+
+    cf_token = settings.get("cf_api_token", "").strip()
+    if not cf_token:
+        push("⚠️ 短影音報表：尚未設定 Cloudflare API Token。")
+        return
+
+    file_paths = [p for p in settings.get("short_video_files", []) if Path(p).exists()]
+    if not file_paths:
+        push("⚠️ 短影音報表：尚無已載入的 CSV，請先在工具中匯入資料。")
+        return
+
+    _NUMERIC = [
+        "總觀眾數", "總觀看次數", "加入購物車總次數",
+        "買家數(可出貨訂單)", "平均客單價(可出貨訂單)", "千次觀看交易額(可出貨訂單)",
+        "有效觀看次數(觀看蝦皮短影音 3 秒以上)",
+    ]
+
+    def _load(path):
+        raw = pd.read_csv(path, encoding="utf-8-sig", header=None, dtype=str)
+        cols = raw.iloc[1].tolist()
+        df = raw.iloc[2:].copy()
+        df.columns = cols
+        df = df[df["數據時段"].str.match(r"^\d{4}-\d{2}-\d{2}$", na=False)].copy()
+        df["日期"] = pd.to_datetime(df["數據時段"], errors="coerce")
+        df = df.dropna(subset=["日期"])
+        for col in _NUMERIC:
+            if col in df.columns:
+                df[col] = pd.to_numeric(
+                    df[col].str.replace(",", "").str.replace("$", "").str.replace("%", ""),
+                    errors="coerce",
+                )
+        return df
+
+    dfs = []
+    for p in file_paths:
+        try:
+            dfs.append(_load(p))
+        except Exception as e:
+            log.warning(f"短影音 CSV 載入失敗 {p}: {e}")
+
+    if not dfs:
+        push("⚠️ 短影音報表：所有 CSV 載入失敗。")
+        return
+
+    merged = (pd.concat(dfs, ignore_index=True)
+              .drop_duplicates(subset=["日期"])
+              .sort_values("日期")
+              .reset_index(drop=True))
+
+    # 取最新月份
+    latest_month = merged["日期"].dt.strftime("%Y-%m").max()
+    df = merged[merged["日期"].dt.strftime("%Y-%m") == latest_month].copy()
+
+    # 計算派生欄位
+    views   = df["總觀看次數"].fillna(0)
+    viewers = df["總觀眾數"].fillna(0)
+    cart    = df["加入購物車總次數"].fillna(0)
+    buyers  = df["買家數(可出貨訂單)"].fillna(0)
+    df["估計收入"] = (buyers * df["平均客單價(可出貨訂單)"].fillna(0)).round(0)
+    df["加購率%"]  = (cart / views * 100).where(views > 0).round(2)
+    df["成交率%"]  = (buyers / viewers * 100).where(viewers > 0).round(2)
+
+    rpv_series = df["千次觀看交易額(可出貨訂單)"].dropna()
+    kpis = {
+        "total_revenue": df["估計收入"].sum(),
+        "avg_rpv":       rpv_series.mean() if not rpv_series.empty else 0,
+        "cart_rate":     cart.sum() / views.sum() * 100 if views.sum() > 0 else 0,
+        "cvr":           buyers.sum() / viewers.sum() * 100 if viewers.sum() > 0 else 0,
+        "days":          len(df),
+        "total_cart":    cart.sum(),
+        "total_buyers":  buyers.sum(),
+    }
+
+    # ── AI 分析 ───────────────────────────────────────────────────────────────────
+    ai_text = ""
+    api_key = settings.get("api_key", "").strip()
+    if api_key:
+        try:
+            import anthropic
+
+            def _n(v):
+                return 0 if (v is None or (isinstance(v, float) and pd.isna(v))) else v
+
+            promo_days = {18, 25}
+            month_num  = int(latest_month.split("-")[1]) if "-" in latest_month else 0
+            rows_txt = []
+            for _, r in df.iterrows():
+                d   = r["日期"]
+                is_promo = (d.day in promo_days) or (d.month == d.day)
+                tag = "★促銷" if is_promo else ""
+                rows_txt.append(
+                    f"{str(d)[:10]}  觀看:{int(_n(r.get('總觀看次數',0))):>6}  "
+                    f"加購:{int(_n(r.get('加入購物車總次數',0))):>4}  "
+                    f"加購率:{_n(r.get('加購率%',0)):.2f}%  "
+                    f"買家:{int(_n(r.get('買家數(可出貨訂單)',0))):>3}  "
+                    f"客單:${_n(r.get('平均客單價(可出貨訂單)',0)):.0f}  "
+                    f"千次交易額:${_n(r.get('千次觀看交易額(可出貨訂單)',0)):.0f}  {tag}"
+                )
+
+            system_ctx = (
+                "你是熟悉蝦皮平台生態的電商數據分析師。\n\n"
+                "【蝦皮平台促銷日曆——分析前必須優先考量】\n"
+                "以下日期出現波動屬正常預期，請歸類為「促銷日效應」：\n"
+                "・月份疊字節：1/1、2/2、3/3、4/4、5/5、6/6、7/7、8/8、9/9、10/10、11/11（雙11）、12/12（雙12）\n"
+                "・每月固定促銷：每月 18 日、25 日\n"
+                "・促銷後一天通常有報復性低谷，屬正常，不需標記\n\n"
+                "分析原則：\n"
+                "1. 促銷日 → 評估「是否達到促銷應有水準」（與同月非促銷日均值比較）\n"
+                "2. 非促銷日異常 → 才算真正值得追查的訊號\n"
+                "3. 輸出繁體中文，簡潔有力，整體不超過 380 字"
+            )
+            prompt = (
+                f"以下是 {latest_month} 短影音帶貨每日數據（★ 為促銷日）：\n\n"
+                + "\n".join(rows_txt)
+                + "\n\n請分析以下三個維度，每個維度 2-3 句，最後給行動建議 3 條（具體可操作）：\n"
+                "1. **促銷日表現評估**：本月促銷日實際表現如何？哪個超預期、哪個低於預期？\n"
+                "2. **非促銷日的真實異常**：排除促銷日後，哪幾天有明顯的客單價或加購率變化？\n"
+                "3. **本月流量品質判斷**：整體觀看數與千次交易額的關係說明了什麼？\n\n"
+                "⚡ 行動建議（3 條，格式：**標題**：內容）"
+            )
+
+            client = anthropic.Anthropic(api_key=api_key)
+            msg = client.messages.create(
+                model=settings.get("model", "claude-haiku-4-5-20251001"),
+                max_tokens=650,
+                system=system_ctx,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            ai_text = msg.content[0].text
+            log.info("AI 分析完成")
+        except Exception as e:
+            log.warning(f"AI 分析失敗（繼續生成報表）：{e}")
+
+    log.info(f"生成短影音報表 HTML：{latest_month}")
+    html = generate(latest_month, df, kpis, ai_text=ai_text, fig=None)
+    url  = PagesUploader(cf_token).upload(html, site_key="short_video")
+
+    share_path = SHOPEE_TOOL_DIR / "data" / "short_video_latest_share.json"
+    share_path.write_text(
+        json.dumps({"url": url, "period": latest_month,
+                    "saved_at": datetime.now().isoformat()},
+                   ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    message = f"🎬 短影音數據報表｜{latest_month}\n\n{url}"
+    if target != "cc_only":
+        push(message)
+        log.info(f"短影音報表已推播: {latest_month} {url}（→員工群）")
+    else:
+        log.info(f"短影音報表完成: {latest_month} {url}（僅回傳 CC）")
     return message
 
 
@@ -725,6 +898,8 @@ if __name__ == "__main__":
         push_competitor_report()
     elif mode == "product_perf":
         push_product_perf_report()
+    elif mode == "short_video":
+        push_short_video_report()
     else:
-        print("用法: python kt_biker_auto.py [shopee|competitor|product_perf]")
+        print("用法: python kt_biker_auto.py [shopee|competitor|product_perf|short_video]")
         sys.exit(1)
