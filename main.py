@@ -360,7 +360,7 @@ def execute_command(cmd: dict, user_id: str = None) -> str:
             st = "✅" if job['enabled'] else "⏸ 已暫停"
             lines.append(f"{st} {job['display_name']}")
             lines.append(f"   {_schedule_label(job)} {job['schedule_hour']:02d}:{job['schedule_minute']:02d}")
-            preview = job['content'].replace('\\n', '\n')[:40].replace('\n', ' ')
+            preview = job['content'].replace('{date}', datetime.now().strftime("%Y/%m/%d")).replace('\\n', '\n')[:40].replace('\n', ' ')
             lines.append(f"   內容預覽：{preview}...")
         return "\n".join(lines)
 
