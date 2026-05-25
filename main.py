@@ -345,7 +345,8 @@ def execute_command(cmd: dict, user_id: str = None) -> str:
         if 'enabled' in u:
             parts.append("狀態：" + ("✅ 已啟用" if u['enabled'] else "⏸ 已暫停"))
         if 'schedule_day' in u:
-            parts.append(f"發送日期：每月 {u['schedule_day']} 號")
+            label = _schedule_label({'schedule_day': u['schedule_day']})
+            parts.append(f"發送日期：{label}")
         if 'schedule_hour' in u:
             parts.append(f"發送時間：{u['schedule_hour']:02d}:{u.get('schedule_minute', 0):02d}")
         if 'content' in u:
@@ -358,7 +359,7 @@ def execute_command(cmd: dict, user_id: str = None) -> str:
         for job in rows.data:
             st = "✅" if job['enabled'] else "⏸ 已暫停"
             lines.append(f"{st} {job['display_name']}")
-            lines.append(f"   每月 {job['schedule_day']} 號 {job['schedule_hour']:02d}:{job['schedule_minute']:02d}")
+            lines.append(f"   {_schedule_label(job)} {job['schedule_hour']:02d}:{job['schedule_minute']:02d}")
             preview = job['content'].replace('\\n', '\n')[:40].replace('\n', ' ')
             lines.append(f"   內容預覽：{preview}...")
         return "\n".join(lines)
