@@ -75,73 +75,43 @@ def _kpi_compare(current: dict, previous: dict) -> dict:
 
 
 def push_shopee_report(target: str = "both"):
-    # 加入蝦皮工具路徑（只加一次）
-    shopee_str = str(SHOPEE_TOOL_DIR)
-    if shopee_str not in sys.path:
-        sys.path.insert(0, shopee_str)
-
-    from core.storage.history_store import HistoryStore
-    from core.reporter.html_exporter import HTMLExporter
-    from core.reporter.cf_pages_uploader import PagesUploader
-
-    # 讀取 Cloudflare API Token
-    settings_path = SHOPEE_TOOL_DIR / "config" / "settings.json"
-    if not settings_path.exists():
-        push("⚠️ 蝦皮廣告報表：找不到工具設定檔。")
+    share_path = SHOPEE_TOOL_DIR / "data" / "latest_share.json"
+    if not share_path.exists():
+        push("⚠️ 蝦皮廣告報表：尚無報表，請先在工具中分析並上傳一期資料。")
         return
-    settings = json.loads(settings_path.read_text(encoding="utf-8"))
-    cf_token = settings.get("cf_api_token", "").strip()
-    if not cf_token:
-        push("⚠️ 蝦皮廣告報表：尚未設定 Cloudflare API Token，請先在工具中設定。")
-        return
-
-    # 取得最新一期歷史記錄
-    data_dir = SHOPEE_TOOL_DIR / "data"
-    history = HistoryStore(str(data_dir))
-    periods = history.get_all_periods()
-    if not periods:
-        push("⚠️ 蝦皮廣告報表：尚無歷史記錄，請先在工具中分析一期資料。")
-        return
-
-    latest_period = periods[-1]
-    rec = history.get_record(latest_period)
-    kpis = rec.get("kpis", {})
-
-    analysis_result = {
-        "kpis": kpis,
-        "comparison": _kpi_compare(kpis, history.get_previous(latest_period)),
-        "anomalies": rec.get("anomalies", []),
-        "charts": rec.get("chart_paths", []),
-        "ai_analysis": rec.get("ai_analysis", ""),
-        "period": latest_period,
-        "metadata": {},
-    }
-
-    log.info(f"生成蝦皮報表 HTML：{latest_period}")
-    html = HTMLExporter().generate(analysis_result)
-    url = PagesUploader(cf_token).upload(html, site_key="shopee_ads")
-
-    # 存檔備用
-    share_path = data_dir / "latest_share.json"
-    share_path.write_text(
-        json.dumps({"url": url, "period": latest_period,
-                    "saved_at": datetime.now().isoformat()},
-                   ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-    message = f"📊 蝦皮廣告報表｜{latest_period}\n\n{url}"
+    share = json.loads(share_path.read_text(encoding="utf-8"))
+    url = share["url"]
+    period = share.get("period", "")
+    message = f"📊 蝦皮廣告報表｜{period}\n\n{url}"
     if target != "cc_only":
         push(message)
-        log.info(f"蝦皮報表已推播: {latest_period} {url}（→員工群）")
+        log.info(f"蝦皮報表已推播: {period} {url}（→員工群）")
     else:
-        log.info(f"蝦皮報表完成: {latest_period} {url}（僅回傳 CC）")
+        log.info(f"蝦皮報表完成: {period} {url}（僅回傳 CC）")
     return message
 
 
 # ── 短影音報表推播（月5號） ──────────────────────────────────────────────────────
 
 def push_short_video_report(target: str = "both"):
+    share_path = SHOPEE_TOOL_DIR / "data" / "short_video_latest_share.json"
+    if not share_path.exists():
+        push("⚠️ 短影音報表：尚無報表，請先在工具中分析並上傳一期資料。")
+        return
+    share = json.loads(share_path.read_text(encoding="utf-8"))
+    url = share["url"]
+    period = share.get("period", "")
+    message = f"🎬 短影音數據報表｜{period}\n\n{url}"
+    if target != "cc_only":
+        push(message)
+        log.info(f"短影音報表已推播: {period} {url}（→員工群）")
+    else:
+        log.info(f"短影音報表完成: {period} {url}（僅回傳 CC）")
+    return message
+
+
+def _push_short_video_report_full(target: str = "both"):
+    """完整重新產生短影音報表（AI 分析 + 上傳 CF Pages）。工具端分享時使用。"""
     import pandas as pd
 
     shopee_str = str(SHOPEE_TOOL_DIR)
@@ -730,7 +700,25 @@ def _match_period(query: str, periods: list) -> str | None:
 
 
 def push_product_perf_report(target: str = "both", period: str = ""):
-    """推播商品表現分析報表（讀 product_perf_history.json，支援指定月份）"""
+    """推播商品表現報表：直接推最後一次上傳的 CF Pages URL，不重新產生。"""
+    share_path = SHOPEE_TOOL_DIR / "data" / "product_perf_latest_share.json"
+    if not share_path.exists():
+        push("⚠️ 商品表現報表：尚無報表，請先在工具中分析並上傳一期資料。")
+        return
+    share = json.loads(share_path.read_text(encoding="utf-8"))
+    url = share["url"]
+    share_period = share.get("period", "")
+    message = f"📦 商品表現報表｜{share_period}\n\n{url}"
+    if target != "cc_only":
+        push(message)
+        log.info(f"商品表現報表已推播: {share_period} {url}（→員工群）")
+    else:
+        log.info(f"商品表現報表完成: {share_period} {url}（僅回傳 CC）")
+    return message
+
+
+def _push_product_perf_report_full(target: str = "both", period: str = ""):
+    """完整重新產生商品表現報表（AI 分析 + 上傳 CF Pages）。工具端分享時使用。"""
     shopee_str = str(SHOPEE_TOOL_DIR)
     if shopee_str not in sys.path:
         sys.path.insert(0, shopee_str)

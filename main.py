@@ -169,19 +169,35 @@ def notify_completed_tasks():
     except Exception as e:
         logger.error(f"notify_completed_tasks error: {e}")
 
+_WEEKDAYS = {'mon','tue','wed','thu','fri','sat','sun'}
+
+def _add_job(jid, func, job: dict):
+    """依 schedule_day 格式決定月排程或週排程。"""
+    day_val = str(job['schedule_day'])
+    hour, minute = job['schedule_hour'], job['schedule_minute']
+    if day_val.lower() in _WEEKDAYS:
+        scheduler.add_job(func, 'cron', id=jid,
+                          day_of_week=day_val.lower(), hour=hour, minute=minute)
+    else:
+        scheduler.add_job(func, 'cron', id=jid,
+                          day=day_val, hour=hour, minute=minute)
+
+def _schedule_label(job: dict) -> str:
+    day_val = str(job['schedule_day'])
+    if day_val.lower() in _WEEKDAYS:
+        names = {'mon':'週一','tue':'週二','wed':'週三','thu':'週四',
+                 'fri':'週五','sat':'週六','sun':'週日'}
+        return f"每{names.get(day_val.lower(), day_val)}"
+    return f"每月{day_val}號"
+
 def load_and_schedule_all():
     rows = supabase.table('bot_schedules').select('*').eq('enabled', True).execute()
     for job in rows.data:
         jid = job['task_name']
         if scheduler.get_job(jid):
             scheduler.remove_job(jid)
-        scheduler.add_job(
-            make_report_func(jid), 'cron', id=jid,
-            day=job['schedule_day'],
-            hour=job['schedule_hour'],
-            minute=job['schedule_minute']
-        )
-        logger.info(f"排程載入: {job['display_name']} 每月{job['schedule_day']}號 {job['schedule_hour']:02d}:{job['schedule_minute']:02d}")
+        _add_job(jid, make_report_func(jid), job)
+        logger.info(f"排程載入: {job['display_name']} {_schedule_label(job)} {job['schedule_hour']:02d}:{job['schedule_minute']:02d}")
     if not scheduler.get_job('notify_completed'):
         scheduler.add_job(notify_completed_tasks, 'interval', id='notify_completed', seconds=60)
 
@@ -214,12 +230,7 @@ def apply_schedule_update(task_name, updates: dict) -> str:
     if scheduler.get_job(task_name):
         scheduler.remove_job(task_name)
     if job.get('enabled'):
-        scheduler.add_job(
-            make_report_func(task_name), 'cron', id=task_name,
-            day=job['schedule_day'],
-            hour=job['schedule_hour'],
-            minute=job['schedule_minute']
-        )
+        _add_job(task_name, make_report_func(task_name), job)
     return job['display_name']
 
 
@@ -294,7 +305,11 @@ I. 取最新報告連結（含「上次的」「最新的」「不重跑」「�
 【對話記憶使用原則】
 - 若前幾則訊息已討論過某任務，新指令直接引用（如「改成傳到群組」指前一個任務）
 - 若上下文能推斷 task_name 或 profile，直接使用，不必再問
-- 跨天的對話記憶同樣有效，記得之前討論過的設定和偏好"""
+- 跨天的對話記憶同樣有效，記得之前討論過的設定和偏好
+
+【輸出格式鐵律】
+- 每則回覆只能輸出一個 JSON 物件，絕對禁止輸出兩個或多個 JSON
+- 若使用者一句話觸發了多個意圖，優先執行最直接的意圖，其他的用自然語言說明"""
 
 
 # ── 修復指令觸發 ──────────────────────────────────────────────
@@ -472,17 +487,22 @@ def process_cc_message(text: str, user_id: str) -> str:
     )
     raw = resp.content[0].text.strip()
 
-    # 嘗試解析 JSON 指令
+    # 嘗試解析 JSON 指令：掃描所有 { 起點，取第一個合法 JSON 執行
     reply = raw
-    try:
-        m = re.search(r'\{.*\}', raw, re.DOTALL)
-        if m:
-            cmd = json.loads(m.group())
-            if cmd.get('action') in ('update_schedule', 'list_schedules', 'manual_push',
-                                     'push_url', 'trigger_local', 'ask_target'):
+    valid_actions = ('update_schedule', 'list_schedules', 'manual_push',
+                     'push_url', 'trigger_local', 'ask_target')
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r'\{', raw):
+        try:
+            cmd, _ = decoder.raw_decode(raw, match.start())
+            if isinstance(cmd, dict) and cmd.get('action') in valid_actions:
                 reply = execute_command(cmd, user_id)
-    except Exception as e:
-        logger.error(f"process_cc_message parse error: {e}, raw: {raw}")
+                break
+        except (json.JSONDecodeError, ValueError):
+            continue
+        except Exception as e:
+            logger.error(f"process_cc_message execute error: {e}, raw: {raw}")
+            break
 
     # API 成功後才更新快取，避免孤立 user 訊息導致對話卡死
     history.append({"role": "user", "content": text})
