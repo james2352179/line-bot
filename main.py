@@ -1231,7 +1231,10 @@ def on_family_message(event):
         # 提醒取消
         is_cancel_q = bool(re.search(r'取消提醒|刪除提醒|不用提醒|取消.*提醒|刪掉提醒', question))
         if is_cancel_q:
-            keyword = parse_reminder_cancel(question)
+            if re.search(r'取消所有|全部取消|清空提醒|所有提醒|全部提醒', question):
+                keyword = '__all__'
+            else:
+                keyword = parse_reminder_cancel(question)
             if keyword:
                 try:
                     if keyword == '__all__':
