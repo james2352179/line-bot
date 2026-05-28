@@ -429,6 +429,99 @@ def check_family_birthdays():
         push_to_group(family_config, FAMILY_GROUP_ID, msg)
         logger.info(f"[家族] 生日提醒已推播：{person['name']}")
 
+def _parse_ai_digest_hour(text: str) -> int | None:
+    afternoon = bool(re.search(r'下午|傍晚|晚上|夜|pm', text, re.IGNORECASE))
+    m = re.search(r'(\d{1,2})\s*[點:時]', text)
+    if m:
+        h = int(m.group(1))
+        if afternoon and h < 12:
+            h += 12
+        if 0 <= h <= 23:
+            return h
+    return None
+
+def _parse_ai_digest_weekday(text: str) -> str:
+    for pattern, key in [
+        (r'週二|星期二|周二', 'tue'), (r'週三|星期三|周三', 'wed'),
+        (r'週四|星期四|周四', 'thu'), (r'週五|星期五|周五', 'fri'),
+        (r'週六|星期六|周六', 'sat'), (r'週日|星期日|周日|週天|星期天', 'sun'),
+        (r'週一|星期一|周一', 'mon'),
+    ]:
+        if re.search(pattern, text):
+            return key
+    return 'mon'
+
+def handle_ai_digest_control(question: str) -> str:
+    """解析 AI 日報控制指令，更新 Supabase ai_digest_config"""
+    try:
+        # 暫停
+        if re.search(r'暫停|停止|停用|關閉|不.*發|取消.*日報|不要.*日報', question):
+            supabase.table('ai_digest_config').upsert({'id': 1, 'enabled': False}).execute()
+            return "✅ AI 日報已暫停，說「啟動AI日報」可恢復"
+
+        # 啟動/恢復
+        if re.search(r'啟動|開啟|恢復|重啟|啟用|開始.*日報', question):
+            supabase.table('ai_digest_config').upsert({'id': 1, 'enabled': True}).execute()
+            row = supabase.table('ai_digest_config').select('*').eq('id', 1).single().execute()
+            cfg = row.data or {}
+            mode = cfg.get('mode', 'daily')
+            hour = cfg.get('hour', 9)
+            if mode == 'weekly':
+                wd = _WEEKDAY_ZH.get(cfg.get('weekday', 'mon'), '一')
+                return f"✅ AI 日報已啟動，每週{wd} {hour:02d}:00 發送"
+            return f"✅ AI 日報已啟動，每天 {hour:02d}:00 發送"
+
+        # 改成週報
+        if re.search(r'週報|每週|每星期|weekly', question, re.IGNORECASE):
+            weekday = _parse_ai_digest_weekday(question)
+            hour_val = _parse_ai_digest_hour(question)
+            updates = {'id': 1, 'mode': 'weekly', 'weekday': weekday}
+            if hour_val is not None:
+                updates['hour'] = hour_val
+            supabase.table('ai_digest_config').upsert(updates).execute()
+            row = supabase.table('ai_digest_config').select('hour').eq('id', 1).single().execute()
+            h = (row.data or {}).get('hour', 9)
+            wd = _WEEKDAY_ZH.get(weekday, '一')
+            return f"✅ 已改成每週{wd} {h:02d}:00 發送週報"
+
+        # 改回日報
+        if re.search(r'改回.*日報|改.*每天|每天.*發|日報.*每天', question):
+            supabase.table('ai_digest_config').upsert({'id': 1, 'mode': 'daily'}).execute()
+            row = supabase.table('ai_digest_config').select('hour').eq('id', 1).single().execute()
+            h = (row.data or {}).get('hour', 9)
+            return f"✅ 已改回每天 {h:02d}:00 發送日報"
+
+        # 修改時間
+        if re.search(r'[改調][到成].*[點時]|時間.*[改調]|[點時].*發送|發送.*[點時]', question):
+            hour_val = _parse_ai_digest_hour(question)
+            if hour_val is not None:
+                supabase.table('ai_digest_config').upsert({'id': 1, 'hour': hour_val}).execute()
+                row = supabase.table('ai_digest_config').select('mode,weekday').eq('id', 1).single().execute()
+                cfg = row.data or {}
+                if cfg.get('mode') == 'weekly':
+                    wd = _WEEKDAY_ZH.get(cfg.get('weekday', 'mon'), '一')
+                    return f"✅ AI 日報時間已改成每週{wd} {hour_val:02d}:00"
+                return f"✅ AI 日報時間已改成每天 {hour_val:02d}:00"
+
+        # 查看狀態
+        row = supabase.table('ai_digest_config').select('*').eq('id', 1).single().execute()
+        if row.data:
+            cfg = row.data
+            enabled_label = "✅ 啟用中" if cfg.get('enabled', True) else "⏸ 已暫停"
+            mode = cfg.get('mode', 'daily')
+            h = cfg.get('hour', 9)
+            if mode == 'weekly':
+                wd = _WEEKDAY_ZH.get(cfg.get('weekday', 'mon'), '一')
+                freq = f"每週{wd}（週報）"
+            else:
+                freq = "每天（日報）"
+            return f"📰 AI 日報狀態\n{enabled_label}\n頻率：{freq}\n時間：{h:02d}:00"
+        return "📰 目前沒有 AI 日報設定"
+    except Exception as e:
+        logger.error(f"handle_ai_digest_control error: {e}")
+        return "AI 日報設定失敗，請稍後再試 😢"
+
+
 def _get_active_vote():
     try:
         r = (supabase.table('family_votes').select('*')
@@ -538,6 +631,7 @@ def notify_completed_tasks():
         logger.error(f"notify_completed_tasks error: {e}")
 
 _WEEKDAYS = {'mon','tue','wed','thu','fri','sat','sun'}
+_WEEKDAY_ZH = {'mon':'一','tue':'二','wed':'三','thu':'四','fri':'五','sat':'六','sun':'日'}
 
 def _add_job(jid, func, job: dict):
     """依 schedule_day 格式決定月排程或週排程。"""
@@ -1329,6 +1423,21 @@ def on_family_message(event):
                 except Exception as e:
                     logger.error(f"[家族 提醒] reply error: {e}")
                 return
+
+        # AI 日報控制
+        is_ai_digest_q = bool(re.search(
+            r'AI日報|ai日報|ai 日報|人工智慧日報|AI新聞|日報.*設定|日報.*時間|日報.*改|日報.*暫停|日報.*啟動|日報.*週報',
+            question, re.IGNORECASE))
+        if is_ai_digest_q:
+            reply_text = handle_ai_digest_control(question)
+            try:
+                with ApiClient(family_config) as api_client:
+                    MessagingApi(api_client).reply_message(
+                        ReplyMessageRequest(reply_token=event.reply_token,
+                                            messages=[TextMessage(text=reply_text)]))
+            except Exception as e:
+                logger.error(f"[家族 AI日報] reply error: {e}")
+            return
 
         # 路程查詢
         route_match = re.search(

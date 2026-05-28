@@ -412,6 +412,27 @@ CLIENT_TASK_HANDLERS = {
     - ❌ 問題：要說很精確的詞才能被理解
     - ✅ 新功能寫進 ADMIN_SYSTEM 提示詞，讓 Claude 語意判斷，不加 keyword 陣列
 
+13. **Bot Manager UI 打不開（2026-05-25 修復）**
+    - 症狀：雙擊 `KT_BIKER_BotManager.app` 或啟動 Bot Manager 時 UI 不出現 / 閃退
+    - 根因 1：`bot_manager.py` 的 `CTkRadioButton` 使用 `radiobutton_color`，目前安裝的 `customtkinter` 不支援，會噴：
+      ```text
+      ValueError: ['radiobutton_color'] are not supported arguments.
+      ```
+    - 修法 1：移除所有 `radiobutton_color=C["blue"]`，保留 `fg_color=C["blue"]` 和 `hover_color=C["blue"]`
+    - 根因 2：`.app` 直接執行 `./venv/bin/python3.12 bot_manager.py` 時，macOS 可能擋住讀取 `venv/pyvenv.cfg`，log 會看到：
+      ```text
+      PermissionError: [Errno 1] Operation not permitted: '.../venv/pyvenv.cfg'
+      ```
+    - 修法 2：`KT_BIKER_BotManager.app/Contents/MacOS/KT_BIKER_BotManager` 只負責 `open "$DIR/KT_BIKER_BotManager啟動.command"`，由 Terminal 啟動真正的 Python UI
+    - 驗證：
+      ```bash
+      cd /Users/kuanghao/Downloads/kuanghao-claude/line-bot
+      ./venv/bin/python3.12 -m py_compile bot_manager.py
+      ./venv/bin/python3.12 -c 'import bot_manager; app = bot_manager.BotManagerApp(); print("ui created ok"); app.destroy()'
+      open KT_BIKER_BotManager.app
+      ```
+    - 注意：`requirements.txt` 必須包含 `customtkinter`
+
 ---
 
 ## 十二、可客製化參數（交給客戶調整的項目）

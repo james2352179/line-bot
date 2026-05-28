@@ -256,7 +256,10 @@ def poll_once():
         log.info(f"任務完成: {task_name}")
     except Exception as e:
         log.error(f"任務失敗: {task_name} — {e}", exc_info=True)
-        _set_status(task_id, "error", str(e))
+        err_msg = str(e)
+        if len(err_msg) > 2000:
+            err_msg = err_msg[:2000] + "…（錯誤訊息過長已截斷）"
+        _set_status(task_id, "error", err_msg)
 
 
 def main():
