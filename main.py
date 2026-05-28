@@ -12,6 +12,7 @@ from linebot.v3.messaging import (
 from linebot.v3.webhooks import MessageEvent, TextMessageContent, JoinEvent
 from linebot.v3.exceptions import InvalidSignatureError
 import anthropic
+import googlemaps
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime, timedelta
 from supabase import create_client
@@ -29,6 +30,7 @@ KT_CHANNEL_SECRET = os.environ['KT_CHANNEL_SECRET']
 KT_CHANNEL_ACCESS_TOKEN = os.environ['KT_CHANNEL_ACCESS_TOKEN']
 ANTHROPIC_API_KEY = os.environ['ANTHROPIC_API_KEY']
 KT_GROUP_ID = os.environ.get('KT_GROUP_ID', '')
+FAMILY_GROUP_ID = os.environ.get('FAMILY_GROUP_ID', '')
 
 supabase = create_client(os.environ['SUPABASE_URL'], os.environ['SUPABASE_KEY'])
 
@@ -36,6 +38,8 @@ cc_handler = WebhookHandler(LINE_CHANNEL_SECRET)
 cc_config = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 kt_handler = WebhookHandler(KT_CHANNEL_SECRET)
 kt_config = Configuration(access_token=KT_CHANNEL_ACCESS_TOKEN)
+family_config = Configuration(access_token=os.environ.get('FAMILY_CHANNEL_ACCESS_TOKEN', ''))
+family_handler = WebhookHandler(os.environ.get('FAMILY_CHANNEL_SECRET', ''))
 
 # ── 客戶登錄表（新增客戶只需在此加一欄 + Railway 環境變數）────────
 CLIENT_REGISTRY = {
@@ -44,17 +48,18 @@ CLIENT_REGISTRY = {
         'token_config': kt_config,
         'group_id': KT_GROUP_ID,
     },
-    # 'client_a': {
-    #     'display_name': 'Client A',
-    #     'token_config': Configuration(access_token=os.environ.get('CLIENT_A_TOKEN', '')),
-    #     'group_id': os.environ.get('CLIENT_A_GROUP_ID', ''),
-    # },
+    'family': {
+        'display_name': '家族',
+        'token_config': family_config,
+        'group_id': FAMILY_GROUP_ID,
+    },
 }
 
 def _client_cfg(client_id: str) -> dict:
     return CLIENT_REGISTRY.get(client_id, CLIENT_REGISTRY['kt_biker'])
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+gmaps = googlemaps.Client(key=os.environ.get('GOOGLE_MAPS_API_KEY', ''))
 MAX_HISTORY_USERS = 50
 histories = {}        # user_id → list[{role,content}]，記憶體快取
 pending_actions = {}  # user_id → (任務 dict, 建立時間)
@@ -101,6 +106,318 @@ def save_exchange(user_id: str, user_msg: str, assistant_msg: str):
     threading.Thread(target=_save, daemon=True).start()
 
 
+# ── 家族功能 ──────────────────────────────────────────────────
+
+_CITY_COORDS = {
+    '台北': (25.0330, 121.5654), '臺北': (25.0330, 121.5654),
+    '新北': (25.0170, 121.4627), '基隆': (25.1276, 121.7392),
+    '桃園': (24.9936, 121.3010), '新竹': (24.8138, 120.9675),
+    '苗栗': (24.5602, 120.8214), '台中': (24.1477, 120.6736),
+    '臺中': (24.1477, 120.6736), '彰化': (24.0518, 120.5161),
+    '南投': (23.9609, 120.9718), '雲林': (23.7092, 120.4313),
+    '嘉義': (23.4801, 120.4491), '台南': (22.9999, 120.2269),
+    '臺南': (22.9999, 120.2269), '高雄': (22.6273, 120.3014),
+    '屏東': (22.5519, 120.5487), '宜蘭': (24.7021, 121.7378),
+    '花蓮': (23.9871, 121.6015), '台東': (22.7972, 121.0717),
+    '臺東': (22.7972, 121.0717), '澎湖': (23.5711, 119.5793),
+    '金門': (24.4493, 118.3767),
+}
+_WMO_CODE = {
+    0:'☀️ 晴天', 1:'🌤 大致晴朗', 2:'⛅ 部分多雲', 3:'☁️ 多雲',
+    45:'🌫 霧', 48:'🌫 霧',
+    51:'🌦 毛毛雨', 53:'🌦 毛毛雨', 55:'🌧 毛毛雨',
+    61:'🌧 小雨', 63:'🌧 中雨', 65:'🌧 大雨',
+    71:'🌨 小雪', 73:'🌨 中雪', 75:'❄️ 大雪',
+    80:'🌦 陣雨', 81:'🌧 陣雨', 82:'⛈ 大陣雨',
+    95:'⛈ 雷暴', 96:'⛈ 雷暴', 99:'⛈ 強雷暴',
+}
+
+def query_weather(city: str, day_offset: int = 0) -> dict | None:
+    """回傳天氣資料 dict；day_offset=0今天，1明天，2後天"""
+    import urllib.request
+    lat, lon = None, None
+    city_name = city
+    for key, coords in _CITY_COORDS.items():
+        if key in city:
+            lat, lon = coords
+            city_name = key
+            break
+    if lat is None:
+        return None
+    try:
+        url = (f"https://api.open-meteo.com/v1/forecast"
+               f"?latitude={lat}&longitude={lon}"
+               f"&current=temperature_2m,apparent_temperature,weathercode,windspeed_10m,relativehumidity_2m"
+               f"&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+               f"&timezone=Asia%2FTaipei&forecast_days=3")
+        with urllib.request.urlopen(url, timeout=5) as r:
+            import json as _json
+            data = _json.loads(r.read())
+        daily = data['daily']
+        idx = min(day_offset, len(daily['weathercode']) - 1)
+        code = daily['weathercode'][idx]
+        rain_prob = daily['precipitation_probability_max'][idx] or 0
+        result = {
+            'city': city_name,
+            'day_offset': day_offset,
+            'desc': _WMO_CODE.get(code, '未知'),
+            'max_temp': daily['temperature_2m_max'][idx],
+            'min_temp': daily['temperature_2m_min'][idx],
+            'rain_prob': rain_prob,
+        }
+        if day_offset == 0:
+            cur = data['current']
+            result.update({
+                'current_temp': cur['temperature_2m'],
+                'feels_like': cur['apparent_temperature'],
+                'humidity': cur['relativehumidity_2m'],
+            })
+        return result
+    except Exception as e:
+        logger.error(f"query_weather error: {e}")
+        return None
+
+def format_weather(w: dict, question: str = '') -> str:
+    """把天氣 dict 格式化，若有 question 就讓 Claude 加上情境建議"""
+    day_label = ['今天', '明天', '後天'][min(w['day_offset'], 2)]
+    lines = [f"🌍 {w['city']}市 {day_label}天氣",
+             w['desc'],
+             f"🔺最高 {w['max_temp']}°C　🔻最低 {w['min_temp']}°C",
+             f"🌂 降雨機率：{w['rain_prob']}%"]
+    if 'current_temp' in w:
+        lines.insert(2, f"🌡 現在 {w['current_temp']}°C（體感 {w['feels_like']}°C）")
+        lines.append(f"💧 濕度：{w['humidity']}%")
+    weather_summary = '\n'.join(lines)
+
+    # 若問題含活動建議類字眼，讓 Claude 加一句話點評
+    if question and re.search(r'適合|要不要|可以|好嗎|怎樣|建議|出門|帶傘|曬|熱|涼|海邊|出遊|爬山|踏青|外出|騎車|打球|烤肉|游泳|戶外', question):
+        try:
+            resp = claude.messages.create(
+                model="claude-haiku-4-5-20251001", max_tokens=80,
+                system="你是家族助理內莉，根據天氣資料給出一句口語化的活動建議，繁體中文，20字內。",
+                messages=[{"role": "user", "content": f"天氣：{weather_summary}\n問題：{question}"}])
+            advice = resp.content[0].text.strip()
+            weather_summary += f"\n\n💬 {advice}"
+        except Exception:
+            pass
+    return weather_summary
+
+# ── 潮汐查詢 ──────────────────────────────────────────────────
+_CWA_GUEST_KEY = 'rdec-key-123-45678-011121314'
+_TIDE_CITY_MAP = {
+    '花蓮': '10015050', '台東': '10015050', '臺東': '10015050',
+    '宜蘭': 'I02200',
+    '基隆': 'I05100', '台北': 'I05100', '臺北': 'I05100',
+    '新北': 'I05100', '桃園': 'I05100', '新竹': 'I05100',
+    '台南': '10013220', '臺南': '10013220',
+    '高雄': '10013220', '屏東': '10013220', '澎湖': '10013220',
+    '嘉義': '10013220', '雲林': '10013220',
+    '墾丁': 'N01100', '恆春': 'N01100',
+}
+_TIDE_STATION_DISPLAY = {
+    '10015050': '花蓮吉安', 'I02200': '梗枋漁港（宜蘭）',
+    'I05100': '下山漁港（基隆）', 'N01100': '船帆石（恆春）',
+    'N00900': '核三廠附近（恆春）', '10013220': '小琉球（屏東）',
+}
+_tide_cache: dict = {}
+
+def query_tide(city: str, day_offset: int = 0) -> dict | None:
+    import urllib.request, json as _json
+    from datetime import datetime, timedelta
+    # 找最近站點
+    station_id = None
+    for key, sid in _TIDE_CITY_MAP.items():
+        if key in city:
+            station_id = sid
+            break
+    if station_id is None:
+        station_id = '10013220'  # 預設小琉球（台南附近）
+    target_date = (datetime.now() + timedelta(days=day_offset)).strftime('%Y-%m-%d')
+    cache_key = f"{station_id}_{target_date}"
+    if cache_key in _tide_cache:
+        return _tide_cache[cache_key]
+    try:
+        cwa_key = os.environ.get('CWA_API_KEY', _CWA_GUEST_KEY)
+        url = (f"https://opendata.cwa.gov.tw/api/v1/rest/datastore/F-A0021-001"
+               f"?Authorization={cwa_key}&format=JSON")
+        with urllib.request.urlopen(url, timeout=8) as r:
+            data = _json.loads(r.read())
+        forecasts = data['result']['records']['TideForecasts']
+        for item in forecasts:
+            loc = item['Location']
+            if loc['LocationId'] != station_id:
+                continue
+            for daily in loc['TimePeriods']['Daily']:
+                if daily['Date'] != target_date:
+                    continue
+                tides = []
+                for t in daily.get('Time', []):
+                    dt = t.get('DateTime', '')
+                    tides.append({
+                        'time': dt[11:16] if len(dt) >= 16 else dt,
+                        'type': t.get('Tide', ''),
+                        'cm': t.get('TideHeights', {}).get('AboveTWVD', ''),
+                    })
+                result = {
+                    'station': _TIDE_STATION_DISPLAY.get(station_id, station_id),
+                    'city': city, 'date': target_date, 'day_offset': day_offset,
+                    'lunar': daily.get('LunarDate', '')[5:],  # "04-11"
+                    'range': daily.get('TideRange', ''),
+                    'tides': tides,
+                }
+                _tide_cache[cache_key] = result
+                return result
+        return None
+    except Exception as e:
+        logger.error(f"query_tide error: {e}")
+        return None
+
+def format_tide_advice(tide: dict, activity: str, question: str) -> str:
+    day_label = ['今天', '明天', '後天'][min(tide['day_offset'], 2)]
+    range_label = {'大': '🌊 大潮', '中': '🌊 中潮', '小': '🌊 小潮'}.get(tide['range'], tide['range'])
+    lines = [
+        f"🌊 {tide['city']} {day_label}潮汐（參考{tide['station']}）",
+        f"農曆 {tide['lunar']} ｜ {range_label}",
+        "",
+    ]
+    for t in tide['tides']:
+        icon = '↑' if t['type'] == '滿潮' else '↓'
+        cm_str = f"（{t['cm']}cm）" if t['cm'] else ''
+        lines.append(f"  {t['time']} {icon}{t['type']}{cm_str}")
+    tide_text = '\n'.join(lines)
+    try:
+        resp = claude.messages.create(
+            model="claude-haiku-4-5-20251001", max_tokens=100,
+            system="你是家族助理內莉。根據潮汐資料，針對指定活動給出最佳時間與注意事項，繁體中文口語化，40字內。",
+            messages=[{"role": "user", "content": f"活動：{activity}\n問題：{question}\n{tide_text}"}])
+        tide_text += f"\n\n💬 {resp.content[0].text.strip()}"
+    except Exception:
+        pass
+    return tide_text
+
+def query_route(origin: str, destination: str) -> str:
+    try:
+        result = gmaps.directions(origin, destination, mode="driving", language="zh-TW")
+        if not result:
+            return f"找不到從「{origin}」到「{destination}」的路線，請確認地名是否正確。"
+        leg = result[0]['legs'][0]
+        distance = leg['distance']['text']
+        duration = leg['duration']['text']
+        o_name = leg['start_address'].split(',')[0]
+        d_name = leg['end_address'].split(',')[0]
+        return (f"🚗 {o_name} → {d_name}\n"
+                f"距離：{distance}\n"
+                f"開車時間：{duration}\n"
+                f"（資料來源：Google Maps）")
+    except Exception as e:
+        logger.error(f"query_route error: {e}")
+        return "路線查詢失敗，請稍後再試 😅"
+
+def parse_reminder_request(question: str) -> dict | None:
+    """用 Claude Haiku 解析提醒請求，回傳 {'target_at': ISO8601, 'message': str} 或 None"""
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M')
+    prompt = (f"現在時間是 {now_str}（台灣時間 UTC+8）。\n"
+              f"使用者說：「{question}」\n\n"
+              f"請判斷這是否是一個提醒設定請求（例如：明天早上9點提醒我刮鬍子、1小時後叫我開會）。\n"
+              f"如果是，輸出純 JSON：{{\"target_at\": \"YYYY-MM-DDTHH:MM:00+08:00\", \"message\": \"提醒事項\"}}\n"
+              f"如果不是，只輸出：null")
+    try:
+        resp = claude.messages.create(
+            model="claude-haiku-4-5-20251001", max_tokens=100,
+            messages=[{"role": "user", "content": prompt}])
+        raw = resp.content[0].text.strip()
+        raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw).strip()
+        if raw.lower() == 'null' or not raw:
+            return None
+        result = json.loads(raw)
+        if isinstance(result, dict) and 'target_at' in result and 'message' in result:
+            return result
+        return None
+    except Exception as e:
+        logger.error(f"parse_reminder_request error: {e}")
+        return None
+
+
+def check_family_reminders():
+    """每分鐘掃描到期的提醒並推播"""
+    try:
+        from datetime import timezone, timedelta as td
+        now_iso = datetime.now(timezone(td(hours=8))).isoformat()
+        rows = (supabase.table('family_reminders')
+                .select('*').lte('target_at', now_iso).eq('sent', False).execute())
+        for r in rows.data:
+            try:
+                msg = f"⏰ 提醒你：{r['message']}"
+                if r['push_type'] == 'group':
+                    push_to_group(family_config, FAMILY_GROUP_ID, msg)
+                else:
+                    with ApiClient(family_config) as api_client:
+                        MessagingApi(api_client).push_message(
+                            PushMessageRequest(to=r['push_target'], messages=[TextMessage(text=msg)]))
+                supabase.table('family_reminders').update({'sent': True}).eq('id', r['id']).execute()
+                logger.info(f"[家族提醒] 已推播：{r['message']}")
+            except Exception as e:
+                logger.error(f"check_family_reminders push error id={r.get('id')}: {e}")
+    except Exception as e:
+        logger.error(f"check_family_reminders error: {e}")
+
+
+def check_family_birthdays():
+    """每天早上 8 點：檢查明天是否有家族成員生日，推播提醒"""
+    tomorrow = datetime.now() + timedelta(days=1)
+    try:
+        rows = (supabase.table('family_birthdays').select('*')
+                .eq('month', tomorrow.month).eq('day', tomorrow.day).execute())
+    except Exception as e:
+        logger.error(f"check_family_birthdays error: {e}")
+        return
+    for person in rows.data:
+        note = f"（{person['note']}）" if person.get('note') else ''
+        prompt = f"明天是家族成員「{person['name']}」的生日{note}，請用繁體中文寫一則溫暖簡短的LINE生日提醒，給整個家族群看的，20~40字，不要加emoji以外的特殊符號。"
+        try:
+            resp = claude.messages.create(
+                model="claude-haiku-4-5-20251001", max_tokens=150,
+                messages=[{"role": "user", "content": prompt}])
+            msg = f"🎂 明天是 {person['name']} 的生日！\n\n{resp.content[0].text}"
+        except Exception:
+            msg = f"🎂 提醒：明天是 {person['name']} 的生日！記得祝賀 🎉"
+        push_to_group(family_config, FAMILY_GROUP_ID, msg)
+        logger.info(f"[家族] 生日提醒已推播：{person['name']}")
+
+def _get_active_vote():
+    try:
+        r = (supabase.table('family_votes').select('*')
+             .eq('status', 'active').order('created_at', desc=True).limit(1).execute())
+        return r.data[0] if r.data else None
+    except Exception:
+        return None
+
+def _format_vote_msg(vote):
+    opts = vote['options']
+    lines = [f"📊 {vote['question']}\n"]
+    for i, opt in enumerate(opts, 1):
+        lines.append(f"{i}️⃣ {opt}")
+    lines.append("\n請回覆數字投票（例：1）")
+    return "\n".join(lines)
+
+def _format_vote_result(vote):
+    opts = vote['options']
+    votes = vote.get('votes') or {}
+    counts = {str(i): 0 for i in range(1, len(opts)+1)}
+    for choice in votes.values():
+        key = str(choice)
+        if key in counts:
+            counts[key] += 1
+    total = sum(counts.values())
+    lines = [f"📊 投票結果：{vote['question']}\n"]
+    for i, opt in enumerate(opts, 1):
+        c = counts[str(i)]
+        bar = "█" * c + "░" * (total - c) if total > 0 else ""
+        lines.append(f"{i}️⃣ {opt}：{c} 票 {bar}")
+    lines.append(f"\n共 {total} 人投票")
+    return "\n".join(lines)
+
+
 # ── 排程管理 ──────────────────────────────────────────────────
 
 def push_to_group(token_config, group_id, message):
@@ -129,43 +446,49 @@ def notify_completed_tasks():
         rows = (supabase.table('pending_tasks').select('*')
                 .in_('status', ['done', 'error']).execute())
         for task in rows.data:
-            params = task.get('params') or {}
-            reply_to = params.get('reply_to_user_id')
-            if not reply_to:
+            try:
+                params = task.get('params') or {}
+                reply_to = params.get('reply_to_user_id')
+                status = task.get('status', 'done')
+                result = (task.get('result') or '').strip()
+                task_name = task.get('task_name', '')
+                labels = {
+                    'competitor_analysis':      '競品分析',
+                    'shopee_push':              '蝦皮廣告報表',
+                    'product_perf_push':        '商品表現報表',
+                    'competitor_status':        '競品分析狀態',
+                    'single_platform_analysis': '單平台競品分析',
+                    'latest_platform_report':   '最新競品報告',
+                    'code_repair':              '程式碼修復',
+                    'short_video_push':         '蝦皮短影音報表',
+                }
+                label = labels.get(task_name, task_name)
+                if reply_to:
+                    if status == 'error':
+                        lines = [f"❌ 【{label}】執行失敗", '', result or '（無錯誤訊息）',
+                                 '', '回覆「修復」讓我嘗試自動修復，或「略過」忽略。']
+                        pending_repairs[reply_to] = ({
+                            'task_name': task_name,
+                            'error': result or '（無錯誤訊息）',
+                            'client': params.get('client', 'kt_biker'),
+                        }, datetime.now())
+                    else:
+                        target = params.get('target', 'both')
+                        header = f"✅ 【{label}】已完成" + ("，已同步推播至員工群" if target != 'cc_only' else "")
+                        lines = [header]
+                        if result and result not in ('推播完成', ''):
+                            lines.append('')
+                            lines.append(result)
+                    msg = '\n'.join(lines)
+                    if len(msg) > 4900:
+                        msg = msg[:4900] + '\n…（訊息過長已截斷）'
+                    push_to_group(cc_config, reply_to, msg)
+                    logger.info(f"已回通知 {task_name}({status}) → {reply_to[:8]}...")
+            except Exception as task_err:
+                logger.error(f"notify task {task.get('id')} ({task.get('task_name')}) error: {task_err}")
+            finally:
                 supabase.table('pending_tasks').delete().eq('id', task['id']).execute()
-                continue
-            status = task.get('status', 'done')
-            result = (task.get('result') or '').strip()
-            task_name = task.get('task_name', '')
-            labels = {
-                'competitor_analysis':      '競品分析',
-                'shopee_push':              '蝦皮廣告報表',
-                'product_perf_push':        '商品表現報表',
-                'competitor_status':        '競品分析狀態',
-                'single_platform_analysis': '單平台競品分析',
-                'latest_platform_report':   '最新競品報告',
-                'code_repair':              '程式碼修復',
-                'short_video_push':         '蝦皮短影音報表',
-            }
-            label = labels.get(task_name, task_name)
-            if status == 'error':
-                lines = [f"❌ 【{label}】執行失敗", '', result or '（無錯誤訊息）',
-                         '', '回覆「修復」讓我嘗試自動修復，或「略過」忽略。']
-                pending_repairs[reply_to] = ({
-                    'task_name': task_name,
-                    'error': result or '（無錯誤訊息）',
-                    'client': params.get('client', 'kt_biker'),
-                }, datetime.now())
-            else:
-                target = params.get('target', 'both')
-                header = f"✅ 【{label}】已完成" + ("，已同步推播至員工群" if target != 'cc_only' else "")
-                lines = [header]
-                if result and result not in ('推播完成', ''):
-                    lines.append('')
-                    lines.append(result)
-            push_to_group(cc_config, reply_to, '\n'.join(lines))
-            supabase.table('pending_tasks').delete().eq('id', task['id']).execute()
-            logger.info(f"已回通知並刪除 {task_name}({status}) → {reply_to[:8]}...")
+                logger.info(f"已刪除 pending_task id={task.get('id')}")
     except Exception as e:
         logger.error(f"notify_completed_tasks error: {e}")
 
@@ -177,10 +500,12 @@ def _add_job(jid, func, job: dict):
     hour, minute = job['schedule_hour'], job['schedule_minute']
     if day_val.lower() in _WEEKDAYS:
         scheduler.add_job(func, 'cron', id=jid,
-                          day_of_week=day_val.lower(), hour=hour, minute=minute)
+                          day_of_week=day_val.lower(), hour=hour, minute=minute,
+                          misfire_grace_time=3600)
     else:
         scheduler.add_job(func, 'cron', id=jid,
-                          day=day_val, hour=hour, minute=minute)
+                          day=day_val, hour=hour, minute=minute,
+                          misfire_grace_time=3600)
 
 def _schedule_label(job: dict) -> str:
     day_val = str(job['schedule_day'])
@@ -200,6 +525,12 @@ def load_and_schedule_all():
         logger.info(f"排程載入: {job['display_name']} {_schedule_label(job)} {job['schedule_hour']:02d}:{job['schedule_minute']:02d}")
     if not scheduler.get_job('notify_completed'):
         scheduler.add_job(notify_completed_tasks, 'interval', id='notify_completed', seconds=60)
+    if not scheduler.get_job('reload_schedules'):
+        scheduler.add_job(load_and_schedule_all, 'interval', id='reload_schedules', minutes=5)
+    if not scheduler.get_job('family_birthdays'):
+        scheduler.add_job(check_family_birthdays, 'cron', id='family_birthdays', hour=8, minute=0)
+    if not scheduler.get_job('family_reminders_check'):
+        scheduler.add_job(check_family_reminders, 'interval', id='family_reminders_check', seconds=60)
 
 def apply_schedule_update(task_name, updates: dict) -> str:
     # 相容處理：CC 可能輸出 hour/minute 分開或合併的 time 字串
@@ -243,6 +574,7 @@ ADMIN_SYSTEM = """你是J大的私人AI助理，同時是 KT BIKER BOT 的指揮
 - 識別到明確的控制指令 → 輸出純 JSON（不含其他文字）
 - 一般對話、業務討論、閒聊、問問題 → 繁體中文自然回答，發揮 AI 助理的完整能力
 - 你了解 J大 的業務：KT BIKER 機車配件品牌，有員工群組，有蝦皮廣告和競品分析工具
+- J大 還有一個家族群（家人），機器人名稱是「內莉」
 
 【控制指令規則】
 
@@ -269,7 +601,7 @@ E. 執行工具（trigger_local）— 判斷 client 與 target：
 
    【client 判斷】
    - 「KT BIKER」「KT」「機車配件」或未指定客戶 → client:"kt_biker"
-   - 未來新增客戶會在此補充對應名稱
+   - 「家族」「家人」「內莉」「家裡」→ client:"family"
 
    【target 判斷】
    - 「傳給我」「發給我」「我要看」「傳上來」「給我看」「私下」→ target:"cc_only"
@@ -284,7 +616,24 @@ E. 執行工具（trigger_local）— 判斷 client 與 target：
    蝦皮短影音報表 → {"action":"trigger_local","task_name":"short_video_push","client":"kt_biker","target":"..."}
    意圖不明 → {"action":"ask_target","task_name":"...","client":"kt_biker","profile":"（若有）"}
 
-F. 推播含 URL → {"action":"push_url","url":"https://...","message":"說明（選填）"}
+F. 推播含 URL → {"action":"push_url","url":"https://...","message":"說明（選填）","client":"kt_biker或family（選填，預設kt_biker）"}
+
+J. 推播自訂文字訊息到指定群組（含「傳」「發」「告訴」「通知」+訊息內容+群組）
+   ⚠️ 只有明確要「傳一段話到群組」才用此 action，生日/投票等管理指令絕對不能用這個
+   → {"action":"push_message","message":"訊息內容","client":"family或kt_biker"}
+
+K. 家族生日管理（含「加生日」「新增生日」「記生日」「登記生日」）
+   測試提醒預覽 → {"action":"test_birthday_reminder"}
+   ⚠️ 這是寫進資料庫的操作，不是傳訊息，絕對不能用 push_message
+   新增生日 → {"action":"add_birthday","name":"媽媽","month":3,"day":15,"note":"送花（選填）"}
+   範例：「幫內莉加生日：菁姊 5/25」→ {"action":"add_birthday","name":"菁姊","month":5,"day":25}
+   查看清單 → {"action":"list_birthdays"}
+   每天早上 8 點自動檢查隔天有無生日，有則推播到家族群
+
+L. 家族投票（問題 + 最多 4 個選項）
+   開始投票 → {"action":"start_vote","question":"週末去哪吃？","options":["火鍋","燒烤","日式"]}
+   結束並公布結果 → {"action":"close_vote"}
+   家族成員在群裡回覆數字（1/2/3）即完成投票
 
 G. 查詢競品分析狀態（含「跑完了嗎」「分析進行中嗎」「狀態」）
    → {"action":"trigger_local","task_name":"competitor_status","client":"kt_biker","target":"cc_only"}
@@ -360,8 +709,6 @@ def execute_command(cmd: dict, user_id: str = None) -> str:
             st = "✅" if job['enabled'] else "⏸ 已暫停"
             lines.append(f"{st} {job['display_name']}")
             lines.append(f"   {_schedule_label(job)} {job['schedule_hour']:02d}:{job['schedule_minute']:02d}")
-            preview = job['content'].replace('{date}', datetime.now().strftime("%Y/%m/%d")).replace('\\n', '\n')[:40].replace('\n', ' ')
-            lines.append(f"   內容預覽：{preview}...")
         return "\n".join(lines)
 
     elif action == 'manual_push':
@@ -377,6 +724,77 @@ def execute_command(cmd: dict, user_id: str = None) -> str:
         push_to_group(cfg['token_config'], cfg['group_id'], content)
         return f"✅ 已手動推播【{row.data['display_name']}】到{cfg['display_name']}員工群"
 
+    elif action == 'add_birthday':
+        name  = cmd.get('name', '').strip()
+        month = cmd.get('month')
+        day   = cmd.get('day')
+        note  = cmd.get('note', '').strip()
+        if not name or not month or not day:
+            return "❌ 請提供 name、month、day"
+        supabase.table('family_birthdays').insert(
+            {'name': name, 'month': int(month), 'day': int(day), 'note': note}).execute()
+        return f"✅ 已新增生日提醒：{name} {month}/{day}"
+
+    elif action == 'test_birthday_reminder':
+        rows = supabase.table('family_birthdays').select('*').execute()
+        if not rows.data:
+            return "📅 還沒有生日資料，請先新增"
+        import random
+        person = random.choice(rows.data)
+        note = f"（{person['note']}）" if person.get('note') else ''
+        prompt = f"明天是家族成員「{person['name']}」的生日{note}，請用繁體中文寫一則溫暖簡短的LINE生日提醒，給整個家族群看的，20~40字，不要加emoji以外的特殊符號。"
+        try:
+            resp = claude.messages.create(
+                model="claude-haiku-4-5-20251001", max_tokens=150,
+                messages=[{"role": "user", "content": prompt}])
+            ai_msg = resp.content[0].text
+        except Exception:
+            ai_msg = f"記得明天是 {person['name']} 的生日！記得祝賀 🎉"
+        preview = f"🎂 明天是 {person['name']} 的生日！\n\n{ai_msg}"
+        return f"📋 生日提醒預覽（模擬對象：{person['name']} {person['month']}/{person['day']}）：\n\n{preview}\n\n✅ 以上是實際會推到家族群的訊息格式"
+
+    elif action == 'list_birthdays':
+        rows = supabase.table('family_birthdays').select('*').order('month').order('day').execute()
+        if not rows.data:
+            return "📅 目前沒有生日記錄"
+        lines = ["📅 家族生日清單：\n"]
+        for r in rows.data:
+            note = f" （{r['note']}）" if r.get('note') else ''
+            lines.append(f"• {r['name']}：{r['month']}/{r['day']}{note}")
+        return "\n".join(lines)
+
+    elif action == 'start_vote':
+        question = cmd.get('question', '').strip()
+        options  = cmd.get('options', [])
+        if not question or len(options) < 2:
+            return "❌ 請提供 question 和至少 2 個 options"
+        active = _get_active_vote()
+        if active:
+            return "❌ 目前已有進行中的投票，請先關閉"
+        row = supabase.table('family_votes').insert(
+            {'question': question, 'options': options, 'votes': {}, 'status': 'active'}).execute()
+        vote = row.data[0]
+        push_to_group(family_config, FAMILY_GROUP_ID, _format_vote_msg(vote))
+        return f"✅ 已在家族群開始投票：{question}"
+
+    elif action == 'close_vote':
+        active = _get_active_vote()
+        if not active:
+            return "❌ 目前沒有進行中的投票"
+        supabase.table('family_votes').update({'status': 'closed'}).eq('id', active['id']).execute()
+        result_msg = _format_vote_result(active)
+        push_to_group(family_config, FAMILY_GROUP_ID, result_msg)
+        return f"✅ 投票已結束，結果已推播到家族群"
+
+    elif action == 'push_message':
+        msg = cmd.get('message', '').strip()
+        client = cmd.get('client', 'kt_biker')
+        if not msg:
+            return "❌ 沒有偵測到訊息內容"
+        cfg = _client_cfg(client)
+        push_to_group(cfg['token_config'], cfg['group_id'], msg)
+        return f"✅ 已傳送到{cfg['display_name']}群"
+
     elif action == 'push_url':
         url = cmd.get('url', '').strip()
         msg = cmd.get('message', '').strip()
@@ -386,7 +804,7 @@ def execute_command(cmd: dict, user_id: str = None) -> str:
         content = f"{msg}\n{url}" if msg else url
         cfg = _client_cfg(client)
         push_to_group(cfg['token_config'], cfg['group_id'], content)
-        return f"✅ 已推播連結到{cfg['display_name']}員工群"
+        return f"✅ 已推播連結到{cfg['display_name']}群"
 
     elif action == 'trigger_local':
         return _do_trigger_local(cmd, user_id)
@@ -491,7 +909,9 @@ def process_cc_message(text: str, user_id: str) -> str:
     # 嘗試解析 JSON 指令：掃描所有 { 起點，取第一個合法 JSON 執行
     reply = raw
     valid_actions = ('update_schedule', 'list_schedules', 'manual_push',
-                     'push_url', 'trigger_local', 'ask_target')
+                     'push_url', 'push_message', 'trigger_local', 'ask_target',
+                     'add_birthday', 'list_birthdays', 'test_birthday_reminder',
+                     'start_vote', 'close_vote')
     decoder = json.JSONDecoder()
     for match in re.finditer(r'\{', raw):
         try:
@@ -610,6 +1030,190 @@ def on_kt_join(event):
 def on_kt_message(event):
     if hasattr(event.source, 'group_id'):
         logger.info(f"[KT BIKER] 群組訊息 ID: {event.source.group_id}")
+
+
+# ── 家族 Webhook ──────────────────────────────────────────────
+
+@app.route('/webhook/family', methods=['POST'])
+def webhook_family():
+    signature = request.headers.get('X-Line-Signature', '')
+    body = request.get_data(as_text=True)
+    try:
+        family_handler.handle(body, signature)
+    except InvalidSignatureError:
+        abort(400)
+    return 'OK'
+
+@family_handler.add(JoinEvent)
+def on_family_join(event):
+    if hasattr(event.source, 'group_id'):
+        logger.info(f"[家族] 加入群組 ID: {event.source.group_id}")
+
+@family_handler.add(MessageEvent, message=TextMessageContent)
+def on_family_message(event):
+    text = event.message.text.strip()
+    user_id = event.source.user_id if hasattr(event.source, 'user_id') else 'unknown'
+    is_group = hasattr(event.source, 'group_id')
+    logger.info(f"[家族] is_group={is_group} text_repr={repr(text[:50])}")
+
+    # 功能 8：投票接收
+    active = _get_active_vote()
+    if active and text in [str(i) for i in range(1, len(active['options']) + 1)]:
+        votes = active.get('votes') or {}
+        votes[user_id] = int(text)
+        supabase.table('family_votes').update({'votes': votes}).eq('id', active['id']).execute()
+        with ApiClient(family_config) as api_client:
+            MessagingApi(api_client).reply_message(
+                ReplyMessageRequest(reply_token=event.reply_token,
+                                    messages=[TextMessage(text="✅ 你的票已記錄！")]))
+        return
+
+    # 功能 4：Q&A
+    # 群組：需要「內莉」或「@內莉」開頭；私聊：直接回應所有訊息
+    is_group = hasattr(event.source, 'group_id')
+    if is_group:
+        if not (text.startswith('內莉') or text.startswith('@內莉')):
+            return
+        question = text.replace('@內莉', '', 1).replace('內莉', '', 1).strip()
+        if not question:
+            return
+    else:
+        question = text
+
+    def _reply():
+        # 潮汐查詢（釣魚、挖蛤蜊、潮汐相關）
+        is_tide_q = bool(re.search(r'釣魚|挖蛤蜊|潮汐|退潮|漲潮|滿潮|乾潮|捕魚|海釣|磯釣|蚵仔|潮水', question))
+        if is_tide_q:
+            if '後天' in question:
+                day_offset = 2
+            elif '明天' in question:
+                day_offset = 1
+            else:
+                day_offset = 0
+            city = None
+            for key in _CITY_COORDS:
+                if key in question:
+                    city = key
+                    break
+            if city is None:
+                city = '台南'
+            if re.search(r'挖蛤蜊|蚵仔|採貝|貝類', question):
+                activity = '挖蛤蜊'
+            elif re.search(r'釣魚|海釣|磯釣|捕魚', question):
+                activity = '釣魚'
+            else:
+                activity = '海邊活動'
+            tide = query_tide(city, day_offset)
+            if tide is None:
+                reply_text = f"抱歉，「{city}」附近暫時沒有潮汐資料 😢"
+            else:
+                reply_text = format_tide_advice(tide, activity, question)
+            try:
+                with ApiClient(family_config) as api_client:
+                    MessagingApi(api_client).reply_message(
+                        ReplyMessageRequest(reply_token=event.reply_token,
+                                            messages=[TextMessage(text=reply_text)]))
+            except Exception as e:
+                logger.error(f"[家族 潮汐] reply error: {e}")
+            return
+
+        # 天氣查詢（支援今天/明天/後天 + 活動建議）
+        is_weather_q = bool(re.search(r'天氣|氣溫|溫度|下雨|會不會雨|降雨|幾度', question))
+        is_activity_q = bool(re.search(r'適合|戶外|海邊|出遊|爬山|踏青|外出|出門|騎車|打球|烤肉|游泳|帶傘', question))
+        if is_weather_q or is_activity_q:
+            # 偵測日期偏移
+            if '後天' in question:
+                day_offset = 2
+            elif '明天' in question:
+                day_offset = 1
+            else:
+                day_offset = 0
+            # 從已知城市清單中掃描問題，找不到就用台南當預設
+            city = None
+            for key in _CITY_COORDS:
+                if key in question:
+                    city = key
+                    break
+            if city is None:
+                city = '台南'
+            w = query_weather(city, day_offset)
+            if w is None:
+                reply_text = f"抱歉，「{city}」查不到天氣資料，目前只支援台灣縣市喔 🌦️"
+            else:
+                reply_text = format_weather(w, question)
+            try:
+                with ApiClient(family_config) as api_client:
+                    MessagingApi(api_client).reply_message(
+                        ReplyMessageRequest(reply_token=event.reply_token,
+                                            messages=[TextMessage(text=reply_text)]))
+            except Exception as e:
+                logger.error(f"[家族 天氣] reply error: {e}")
+            return
+
+        # 提醒設定（提醒我、叫我、幫我提醒等）
+        is_reminder_q = bool(re.search(r'提醒我|提醒一下|幫我提醒|設提醒|叫我', question))
+        if is_reminder_q:
+            parsed = parse_reminder_request(question)
+            if parsed:
+                push_type = 'group' if is_group else 'user'
+                push_target = FAMILY_GROUP_ID if is_group else user_id
+                try:
+                    supabase.table('family_reminders').insert({
+                        'user_id': user_id,
+                        'message': parsed['message'],
+                        'target_at': parsed['target_at'],
+                        'push_target': push_target,
+                        'push_type': push_type,
+                        'sent': False,
+                    }).execute()
+                    try:
+                        dt = datetime.fromisoformat(parsed['target_at'])
+                        time_str = f"{dt.month}/{dt.day} {dt.hour:02d}:{dt.minute:02d}"
+                    except Exception:
+                        time_str = parsed['target_at']
+                    reply_text = f"好的！⏰ 我會在 {time_str} 提醒你：{parsed['message']}"
+                except Exception as e:
+                    logger.error(f"[家族提醒] save error: {e}")
+                    reply_text = "抱歉，提醒設定失敗，請稍後再試 😢"
+                try:
+                    with ApiClient(family_config) as api_client:
+                        MessagingApi(api_client).reply_message(
+                            ReplyMessageRequest(reply_token=event.reply_token,
+                                                messages=[TextMessage(text=reply_text)]))
+                except Exception as e:
+                    logger.error(f"[家族 提醒] reply error: {e}")
+                return
+
+        # 路程查詢
+        route_match = re.search(
+            r'從\s*(.+?)\s*到\s*(.+?)(?:\s*多遠|多久|路程|距離|開車|怎麼走|怎麼開|要幾分|要多久|$)',
+            question)
+        if not route_match:
+            route_match = re.search(
+                r'(.+?)\s*(?:到|→|至|~)\s*(.+?)(?:\s*多遠|多久|路程|距離|開車|怎麼走|怎麼開|要幾分|要多久)',
+                question)
+        if route_match:
+            origin = route_match.group(1).strip()
+            destination = route_match.group(2).strip()
+            reply_text = query_route(origin, destination)
+        else:
+            try:
+                resp = claude.messages.create(
+                    model="claude-haiku-4-5-20251001", max_tokens=200,
+                    system="你是溫暖親切的家族助理，名叫內莉。用繁體中文、口語化的方式回答，回答簡潔（100字內）。",
+                    messages=[{"role": "user", "content": question}])
+                reply_text = resp.content[0].text.strip()
+            except Exception as e:
+                reply_text = "抱歉，我現在有點忙～稍後再試試看 😅"
+                logger.error(f"[家族 Q&A] error: {e}")
+        try:
+            with ApiClient(family_config) as api_client:
+                MessagingApi(api_client).reply_message(
+                    ReplyMessageRequest(reply_token=event.reply_token,
+                                        messages=[TextMessage(text=reply_text)]))
+        except Exception as e:
+            logger.error(f"[家族 Q&A] reply error: {e}")
+    threading.Thread(target=_reply, daemon=True).start()
 
 
 # ── 啟動 ─────────────────────────────────────────────────────
