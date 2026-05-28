@@ -1196,7 +1196,7 @@ def on_family_message(event):
             return
 
         # 提醒清單查詢
-        is_list_reminder_q = bool(re.search(r'提醒清單|查提醒|列出提醒|有什麼提醒|哪些提醒|查看提醒|目前的提醒|有沒有提醒', question))
+        is_list_reminder_q = bool(re.search(r'提醒清單|查提醒|列出.*提醒|有什麼提醒|哪些提醒|查看提醒|目前.*提醒|有沒有提醒|我的提醒', question))
         if is_list_reminder_q:
             try:
                 from datetime import timezone, timedelta as _td
