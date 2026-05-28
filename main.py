@@ -315,7 +315,8 @@ def query_route(origin: str, destination: str) -> str:
 
 def parse_reminder_request(question: str) -> dict | None:
     """用 Claude Haiku 解析提醒請求，回傳 {'target_at': ISO8601, 'message': str} 或 None"""
-    now_str = datetime.now().strftime('%Y-%m-%d %H:%M')
+    from datetime import timezone, timedelta as _td
+    now_str = datetime.now(timezone(_td(hours=8))).strftime('%Y-%m-%d %H:%M')
     prompt = (f"現在時間是 {now_str}（台灣時間 UTC+8）。\n"
               f"使用者說：「{question}」\n\n"
               f"請判斷這是否是一個提醒設定請求（例如：明天早上9點提醒我刮鬍子、1小時後叫我開會）。\n"
