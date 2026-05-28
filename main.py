@@ -339,6 +339,50 @@ def parse_reminder_request(question: str) -> dict | None:
         return None
 
 
+def parse_reminder_cancel(question: str) -> str | None:
+    """回傳要取消的事項關鍵字、'__all__'（全部），或 None（非取消請求）"""
+    prompt = (f"使用者說：「{question}」\n\n"
+              f"這是否是取消/刪除提醒的請求？（例如：取消睡覺的提醒、不用提醒我喝水、刪掉提醒）\n"
+              f"如果是，輸出要取消的事項關鍵字（純文字，例如：睡覺、喝水）\n"
+              f"如果要取消全部提醒，輸出：__all__\n"
+              f"如果不是取消請求，只輸出：null")
+    try:
+        resp = claude.messages.create(
+            model="claude-haiku-4-5-20251001", max_tokens=30,
+            messages=[{"role": "user", "content": prompt}])
+        raw = resp.content[0].text.strip()
+        return None if raw.lower() == 'null' or not raw else raw
+    except Exception as e:
+        logger.error(f"parse_reminder_cancel error: {e}")
+        return None
+
+
+def parse_reminder_modify(question: str) -> dict | None:
+    """回傳 {'keyword': '事項關鍵字', 'target_at': 'ISO8601'} 或 None"""
+    from datetime import timezone, timedelta as _td
+    now_str = datetime.now(timezone(_td(hours=8))).strftime('%Y-%m-%d %H:%M')
+    prompt = (f"現在時間是 {now_str}（台灣時間 UTC+8）。\n"
+              f"使用者說：「{question}」\n\n"
+              f"這是否是修改提醒時間的請求？（例如：把睡覺提醒改到2點、把喝水的提醒延後30分鐘）\n"
+              f"如果是，輸出純 JSON：{{\"keyword\": \"事項關鍵字\", \"target_at\": \"YYYY-MM-DDTHH:MM:00+08:00\"}}\n"
+              f"如果不是，只輸出：null")
+    try:
+        resp = claude.messages.create(
+            model="claude-haiku-4-5-20251001", max_tokens=80,
+            messages=[{"role": "user", "content": prompt}])
+        raw = resp.content[0].text.strip()
+        raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw).strip()
+        if raw.lower() == 'null' or not raw:
+            return None
+        result = json.loads(raw)
+        if isinstance(result, dict) and 'keyword' in result and 'target_at' in result:
+            return result
+        return None
+    except Exception as e:
+        logger.error(f"parse_reminder_modify error: {e}")
+        return None
+
+
 def check_family_reminders():
     """每分鐘掃描到期的提醒並推播"""
     try:
@@ -1150,6 +1194,104 @@ def on_family_message(event):
             except Exception as e:
                 logger.error(f"[家族 天氣] reply error: {e}")
             return
+
+        # 提醒清單查詢
+        is_list_reminder_q = bool(re.search(r'提醒清單|查提醒|列出提醒|有什麼提醒|哪些提醒|查看提醒|目前的提醒|有沒有提醒', question))
+        if is_list_reminder_q:
+            try:
+                from datetime import timezone, timedelta as _td
+                now_iso = datetime.now(timezone(_td(hours=8))).isoformat()
+                rows = (supabase.table('family_reminders')
+                        .select('*').eq('sent', False).gte('target_at', now_iso)
+                        .order('target_at').execute())
+                if not rows.data:
+                    reply_text = "目前沒有待處理的提醒事項 😊"
+                else:
+                    lines = ["📋 待處理提醒：\n"]
+                    for r in rows.data:
+                        try:
+                            dt = datetime.fromisoformat(r['target_at'])
+                            time_str = f"{dt.month}/{dt.day} {dt.hour:02d}:{dt.minute:02d}"
+                        except Exception:
+                            time_str = r['target_at']
+                        lines.append(f"⏰ {time_str} {r['message']}")
+                    reply_text = '\n'.join(lines)
+            except Exception as e:
+                logger.error(f"[家族提醒] list error: {e}")
+                reply_text = "查詢提醒清單失敗，請稍後再試 😢"
+            try:
+                with ApiClient(family_config) as api_client:
+                    MessagingApi(api_client).reply_message(
+                        ReplyMessageRequest(reply_token=event.reply_token,
+                                            messages=[TextMessage(text=reply_text)]))
+            except Exception as e:
+                logger.error(f"[家族 提醒清單] reply error: {e}")
+            return
+
+        # 提醒取消
+        is_cancel_q = bool(re.search(r'取消提醒|刪除提醒|不用提醒|取消.*提醒|刪掉提醒', question))
+        if is_cancel_q:
+            keyword = parse_reminder_cancel(question)
+            if keyword:
+                try:
+                    if keyword == '__all__':
+                        supabase.table('family_reminders').delete().eq('user_id', user_id).eq('sent', False).execute()
+                        reply_text = "✅ 已取消所有待處理的提醒"
+                    else:
+                        rows = (supabase.table('family_reminders')
+                                .select('id,message').eq('sent', False)
+                                .filter('message', 'ilike', f'%{keyword}%').execute())
+                        if not rows.data:
+                            reply_text = f"找不到「{keyword}」相關的待處理提醒 🤔"
+                        else:
+                            for r in rows.data:
+                                supabase.table('family_reminders').delete().eq('id', r['id']).execute()
+                            msgs = '、'.join(r['message'] for r in rows.data)
+                            reply_text = f"✅ 已取消提醒：{msgs}"
+                except Exception as e:
+                    logger.error(f"[家族提醒] cancel error: {e}")
+                    reply_text = "取消提醒失敗，請稍後再試 😢"
+                try:
+                    with ApiClient(family_config) as api_client:
+                        MessagingApi(api_client).reply_message(
+                            ReplyMessageRequest(reply_token=event.reply_token,
+                                                messages=[TextMessage(text=reply_text)]))
+                except Exception as e:
+                    logger.error(f"[家族 取消提醒] reply error: {e}")
+                return
+
+        # 提醒修改
+        is_modify_q = bool(re.search(r'修改提醒|改.*提醒|提醒.*改到|延後.*提醒|提醒.*延', question))
+        if is_modify_q:
+            parsed = parse_reminder_modify(question)
+            if parsed:
+                try:
+                    rows = (supabase.table('family_reminders')
+                            .select('id,message').eq('sent', False)
+                            .filter('message', 'ilike', f'%{parsed["keyword"]}%').execute())
+                    if not rows.data:
+                        reply_text = f"找不到「{parsed['keyword']}」相關的待處理提醒 🤔"
+                    else:
+                        rid = rows.data[0]['id']
+                        msg = rows.data[0]['message']
+                        supabase.table('family_reminders').update({'target_at': parsed['target_at']}).eq('id', rid).execute()
+                        try:
+                            dt = datetime.fromisoformat(parsed['target_at'])
+                            time_str = f"{dt.month}/{dt.day} {dt.hour:02d}:{dt.minute:02d}"
+                        except Exception:
+                            time_str = parsed['target_at']
+                        reply_text = f"✅ 已把「{msg}」改到 {time_str} 提醒你"
+                except Exception as e:
+                    logger.error(f"[家族提醒] modify error: {e}")
+                    reply_text = "修改提醒失敗，請稍後再試 😢"
+                try:
+                    with ApiClient(family_config) as api_client:
+                        MessagingApi(api_client).reply_message(
+                            ReplyMessageRequest(reply_token=event.reply_token,
+                                                messages=[TextMessage(text=reply_text)]))
+                except Exception as e:
+                    logger.error(f"[家族 修改提醒] reply error: {e}")
+                return
 
         # 提醒設定（提醒我、叫我、幫我提醒等）
         is_reminder_q = bool(re.search(r'提醒我|提醒一下|幫我提醒|設提醒|叫我', question))
