@@ -316,11 +316,20 @@ def query_route(origin: str, destination: str) -> str:
 def parse_reminder_request(question: str) -> dict | None:
     """用 Claude Haiku 解析提醒請求，回傳 {'target_at': ISO8601, 'message': str} 或 None"""
     from datetime import timezone, timedelta as _td
-    now_str = datetime.now(timezone(_td(hours=8))).strftime('%Y-%m-%d %H:%M')
+    _now = datetime.now(timezone(_td(hours=8)))
+    _weekday = '一二三四五六日'[_now.weekday()]
+    now_str = _now.strftime('%Y-%m-%d %H:%M') + f'（星期{_weekday}）'
     prompt = (f"現在時間是 {now_str}（台灣時間 UTC+8）。\n"
               f"使用者說：「{question}」\n\n"
-              f"請判斷這是否是一個提醒設定請求（例如：明天早上9點提醒我刮鬍子、1小時後叫我開會）。\n"
-              f"如果是，輸出純 JSON：{{\"target_at\": \"YYYY-MM-DDTHH:MM:00+08:00\", \"message\": \"提醒事項\"}}\n"
+              f"請判斷這是否是一個提醒設定請求（例如：明天早上9點提醒我刮鬍子、1小時後叫我開會）。\n\n"
+              f"時間判讀規則（重要）：\n"
+              f"1. 若使用者沒明確講「上午/下午/早上/晚上」也沒講「明天/某月某日」，"
+              f"一律解讀成「從現在算起最近的下一次」，也就是今天還沒到就排今天，今天已過才排明天。\n"
+              f"   例：現在 20:56，使用者說「9:30」或「等一下9:30」→ 今天 21:30（不是隔天早上）。\n"
+              f"   例：現在 20:56，使用者說「7點」→ 今天的時間已過，排明天 07:00。\n"
+              f"2.「等一下/待會/等等/晚點」代表今天接下來的時間，絕對不要跳到隔天。\n"
+              f"3. 只有使用者明確講「明天」「後天」「X月X日」「早上/上午」時才照字面排。\n\n"
+              f"如果是提醒請求，輸出純 JSON：{{\"target_at\": \"YYYY-MM-DDTHH:MM:00+08:00\", \"message\": \"提醒事項\"}}\n"
               f"如果不是，只輸出：null")
     try:
         resp = claude.messages.create(
@@ -360,10 +369,15 @@ def parse_reminder_cancel(question: str) -> str | None:
 def parse_reminder_modify(question: str) -> dict | None:
     """回傳 {'keyword': '事項關鍵字', 'target_at': 'ISO8601'} 或 None"""
     from datetime import timezone, timedelta as _td
-    now_str = datetime.now(timezone(_td(hours=8))).strftime('%Y-%m-%d %H:%M')
+    _now = datetime.now(timezone(_td(hours=8)))
+    _weekday = '一二三四五六日'[_now.weekday()]
+    now_str = _now.strftime('%Y-%m-%d %H:%M') + f'（星期{_weekday}）'
     prompt = (f"現在時間是 {now_str}（台灣時間 UTC+8）。\n"
               f"使用者說：「{question}」\n\n"
-              f"這是否是修改提醒時間的請求？（例如：把睡覺提醒改到2點、把喝水的提醒延後30分鐘）\n"
+              f"這是否是修改提醒時間的請求？（例如：把睡覺提醒改到2點、把喝水的提醒延後30分鐘）\n\n"
+              f"時間判讀規則（重要）：若使用者沒明確講「上午/下午/早上/晚上」也沒講「明天/某月某日」，"
+              f"一律解讀成「從現在算起最近的下一次」——今天還沒到就排今天，今天已過才排明天；"
+              f"「等一下/待會/晚點」一律是今天接下來的時間，不要跳到隔天。\n\n"
               f"如果是，輸出純 JSON：{{\"keyword\": \"事項關鍵字\", \"target_at\": \"YYYY-MM-DDTHH:MM:00+08:00\"}}\n"
               f"如果不是，只輸出：null")
     try:
@@ -634,12 +648,16 @@ _WEEKDAYS = {'mon','tue','wed','thu','fri','sat','sun'}
 _WEEKDAY_ZH = {'mon':'一','tue':'二','wed':'三','thu':'四','fri':'五','sat':'六','sun':'日'}
 
 def _add_job(jid, func, job: dict):
-    """依 schedule_day 格式決定月排程或週排程。"""
+    """依 schedule_day 格式決定每日/週/月排程。"""
     day_val = str(job['schedule_day'])
     hour, minute = job['schedule_hour'], job['schedule_minute']
     if day_val.lower() in _WEEKDAYS:
         scheduler.add_job(func, 'cron', id=jid,
                           day_of_week=day_val.lower(), hour=hour, minute=minute,
+                          misfire_grace_time=3600)
+    elif day_val.lower() == 'daily':
+        scheduler.add_job(func, 'cron', id=jid,
+                          hour=hour, minute=minute,
                           misfire_grace_time=3600)
     else:
         scheduler.add_job(func, 'cron', id=jid,
@@ -652,6 +670,8 @@ def _schedule_label(job: dict) -> str:
         names = {'mon':'週一','tue':'週二','wed':'週三','thu':'週四',
                  'fri':'週五','sat':'週六','sun':'週日'}
         return f"每{names.get(day_val.lower(), day_val)}"
+    if day_val.lower() == 'daily':
+        return "每天"
     return f"每月{day_val}號"
 
 def load_and_schedule_all():
@@ -735,6 +755,9 @@ D. 修改排程設定
    - 內容 → "content": "訊息文字"
    - 顯示名稱 → "display_name": "名稱"
    新增不存在的任務也用 update_schedule，系統會自動建立
+
+E. 刪除排程（含「刪除」「移除」「取消排程」+任務名稱）
+   → {"action":"delete_schedule","task_name":"XXX"}
 
 E. 執行工具（trigger_local）— 判斷 client 與 target：
 
@@ -840,6 +863,31 @@ def execute_command(cmd: dict, user_id: str = None) -> str:
         if 'content' in u:
             parts.append("播報內容：已更新")
         return f"✅ 【{display_name}】設定完成\n" + "\n".join(parts)
+
+    elif action == 'delete_schedule':
+        keyword = cmd['task_name']
+        # 先精確比對 task_name，找不到再模糊比對 display_name
+        rows = supabase.table('bot_schedules').select('task_name,display_name').execute()
+        matched = None
+        for r in (rows.data or []):
+            if r['task_name'] == keyword:
+                matched = r
+                break
+        if not matched:
+            kw_lower = keyword.lower()
+            for r in (rows.data or []):
+                if kw_lower in (r.get('display_name') or '').lower() or kw_lower in r['task_name'].lower():
+                    matched = r
+                    break
+        if not matched:
+            return f"❌ 找不到含「{keyword}」的排程，請用「查看排程」確認名稱"
+        real_task = matched['task_name']
+        display_name = matched['display_name']
+        if scheduler.get_job(real_task):
+            scheduler.remove_job(real_task)
+        supabase.table('bot_schedules').delete().eq('task_name', real_task).execute()
+        logger.info(f"排程已刪除: {real_task}")
+        return f"🗑️ 【{display_name}】排程已刪除"
 
     elif action == 'list_schedules':
         rows = supabase.table('bot_schedules').select('*').execute()
@@ -1047,7 +1095,7 @@ def process_cc_message(text: str, user_id: str) -> str:
 
     # 嘗試解析 JSON 指令：掃描所有 { 起點，取第一個合法 JSON 執行
     reply = raw
-    valid_actions = ('update_schedule', 'list_schedules', 'manual_push',
+    valid_actions = ('update_schedule', 'delete_schedule', 'list_schedules', 'manual_push',
                      'push_url', 'push_message', 'trigger_local', 'ask_target',
                      'add_birthday', 'list_birthdays', 'test_birthday_reminder',
                      'start_vote', 'close_vote')
