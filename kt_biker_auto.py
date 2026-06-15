@@ -36,7 +36,9 @@ SHOPEE_TOOL_DIR   = Path("/Users/kuanghao/Downloads/kuanghao-claude/kh_shopee_to
 COMPETITOR_DIR    = Path("/Users/kuanghao/Downloads/kuanghao-claude/kh_competitor_tool")
 COMPETITOR_URL    = "http://127.0.0.1:5173"
 COMPETITOR_PID    = "3b1c961a"   # 汽車美容用品業
-PYTHON            = "/opt/homebrew/bin/python3.12"
+# 競品戰情室 webapp 的依賴（flask/playwright/pywebview）裝在系統 python3，
+# 與手動雙擊 launch.command 用的直譯器一致；勿改回 homebrew python3.12（缺 flask 會啟動逾時）
+PYTHON            = "/usr/bin/python3"
 
 
 # ── LINE 推播 ─────────────────────────────────────────────────────────────────
@@ -305,17 +307,27 @@ def _find_profile_id(keyword: str) -> str | None:
 
 def _start_webapp():
     log.info("啟動競品戰情室 webapp…")
-    subprocess.Popen(
+    # 不要把輸出丟 DEVNULL：失敗時（如 ModuleNotFoundError）才查得到原因
+    startup_log = COMPETITOR_DIR / "data" / "webapp_startup.log"
+    startup_log.parent.mkdir(parents=True, exist_ok=True)
+    logf = open(startup_log, "w")
+    proc = subprocess.Popen(
         [PYTHON, "webapp/app.py"],
         cwd=str(COMPETITOR_DIR),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=logf,
+        stderr=subprocess.STDOUT,
     )
     for _ in range(30):   # 最多等 60 秒
         time.sleep(2)
         if _webapp_ready():
             log.info("webapp 就緒")
             return True
+        if proc.poll() is not None:   # process 提早死亡，不用空等 60 秒
+            logf.flush()
+            tail = startup_log.read_text(errors="replace")[-500:]
+            log.error(f"webapp 啟動即崩潰 (exit={proc.returncode})，log 末段：\n{tail}")
+            return False
+    log.error(f"webapp 啟動逾時（60 秒未就緒），詳見 {startup_log}")
     return False
 
 
