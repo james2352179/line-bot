@@ -3,7 +3,7 @@
 KT BIKER 自動化推播腳本
 用法：
   python kt_biker_auto.py shopee      # 月2號：推蝦皮最新報表
-  python kt_biker_auto.py competitor  # 月1、15號：跑競品分析並推播
+  python kt_biker_auto.py competitor  # 每週一：跑競品分析週報並推播
 """
 import json
 import os
@@ -36,6 +36,9 @@ SHOPEE_TOOL_DIR   = Path("/Users/kuanghao/Downloads/kuanghao-claude/kh_shopee_to
 COMPETITOR_DIR    = Path("/Users/kuanghao/Downloads/kuanghao-claude/kh_competitor_tool")
 COMPETITOR_URL    = "http://127.0.0.1:5173"
 COMPETITOR_PID    = "3b1c961a"   # 汽車美容用品業
+COMPETITOR_PROFILES_DIR = COMPETITOR_DIR / "webapp" / "data" / "profiles"
+# 競品「綜合分析報告」推送目標：審核期先發給 J大(CC)，穩定後改 "group" 自動發員工群
+COMPETITOR_SUMMARY_TARGET = "cc"   # "cc" → 推 J大個人；"group" → 推員工群
 # 競品戰情室 webapp 的依賴（flask/playwright/pywebview）裝在系統 python3，
 # 與手動雙擊 launch.command 用的直譯器一致；勿改回 homebrew python3.12（缺 flask 會啟動逾時）
 PYTHON            = "/usr/bin/python3"
@@ -54,6 +57,25 @@ def push(message: str):
         log.error(f"LINE push 失敗: {resp.status_code} {resp.text}")
     else:
         log.info("LINE push 成功")
+
+
+def push_cc(message: str):
+    """推送到 J大 個人 LINE（走 CC bot），供排程產出的報告先給 J大 審核用。"""
+    token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+    cc_id = os.environ.get("CC_USER_ID", "")
+    if not token or not cc_id:
+        log.error("push_cc 失敗：缺 LINE_CHANNEL_ACCESS_TOKEN 或 CC_USER_ID")
+        return
+    resp = requests.post(
+        "https://api.line.me/v2/bot/message/push",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json={"to": cc_id, "messages": [{"type": "text", "text": message}]},
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        log.error(f"LINE push_cc 失敗: {resp.status_code} {resp.text}")
+    else:
+        log.info("LINE push_cc 成功（→ J大 CC）")
 
 
 # ── 蝦皮報表推播（月2號） ──────────────────────────────────────────────────────
@@ -282,7 +304,7 @@ def _push_short_video_report_full(target: str = "both"):
     return message
 
 
-# ── 競品戰情室推播（月1、15號） ────────────────────────────────────────────────
+# ── 競品戰情室週報推播（每週一 9:00） ────────────────────────────────────────────
 
 def _webapp_ready() -> bool:
     try:
@@ -413,6 +435,222 @@ def _run_analysis_and_wait():
     return False
 
 
+_PLATFORM_LABELS = {"yt": "YouTube", "tt": "TikTok", "fb": "Facebook",
+                    "ig": "Instagram", "th": "Threads"}
+_SUFFIX_TO_KEY = {"yt": "youtube", "tt": "tiktok", "fb": "facebook",
+                  "ig": "instagram", "th": "threads"}
+
+
+def _is_client_brand(name: str) -> bool:
+    return "ktbiker" in (name or "").lower().replace(" ", "")
+
+
+def _fmt_int(x) -> str:
+    try:
+        return f"{int(x):,}"
+    except Exception:
+        return str(x or 0)
+
+
+def _load_competitor_results(profile_id: str) -> dict:
+    """讀取 5 平台分析結果 JSON，回傳 {suffix: data}（缺檔略過）。"""
+    out = {}
+    for suffix in ("yt", "tt", "fb", "ig", "th"):
+        p = COMPETITOR_PROFILES_DIR / f"{profile_id}_{suffix}_results.json"
+        if p.exists():
+            try:
+                out[suffix] = json.loads(p.read_text(encoding="utf-8"))
+            except Exception as e:
+                log.warning(f"讀取 {p.name} 失敗: {e}")
+    return out
+
+
+def _build_competitor_digest(results: dict) -> tuple[str, list]:
+    """把 5 平台結果壓成餵給 Claude 的精簡摘要文字；同時回傳各平台關鍵數據(供 HTML)。"""
+    parts, stats = [], []
+    for suffix, d in results.items():
+        label = _PLATFORM_LABELS.get(suffix, suffix)
+        date_range = d.get("date_range") or d.get("timestamp", "")
+        active = d.get("active_channels", 0)
+        total_ch = d.get("total_channels", 0)
+        total_vid = d.get("total_videos", 0)
+        avg_views = d.get("avg_views", 0)
+        avg_likes = d.get("avg_likes")
+        stats.append({"label": label, "date_range": date_range, "active": active,
+                      "total_ch": total_ch, "total_vid": total_vid, "avg_views": avg_views})
+
+        head = (f"### {label}（{date_range}）\n"
+                f"活躍帳號 {active}/{total_ch}，內容 {total_vid} 則，平均觀看 {_fmt_int(avg_views)}")
+        if avg_likes is not None:
+            head += f"，平均讚 {_fmt_int(avg_likes)}"
+        parts.append(head)
+
+        # 帳號表現（依內容數排序，取前 8）
+        channels = d.get("channels", {})
+        if isinstance(channels, dict) and channels:
+            rows = sorted(channels.items(),
+                          key=lambda kv: (kv[1] or {}).get("video_count", 0) or 0, reverse=True)
+            ch_lines = []
+            for name, c in rows[:8]:
+                if not isinstance(c, dict):
+                    continue
+                vc = c.get("video_count", 0)
+                if not vc:
+                    continue
+                mark = " ★自家品牌" if _is_client_brand(name) else ""
+                seg = f"- {name}{mark}：{vc} 則，平均觀看 {_fmt_int(c.get('avg_views', 0))}"
+                if c.get("total_likes") is not None:
+                    seg += f"，總讚 {_fmt_int(c.get('total_likes', 0))}"
+                if c.get("engagement_rate") is not None:
+                    seg += f"，互動率 {c.get('engagement_rate')}"
+                ch_lines.append(seg)
+            if ch_lines:
+                parts.append("帳號表現：\n" + "\n".join(ch_lines))
+
+        # 熱門內容（取前 3）
+        tops = d.get("top_videos") or d.get("top_by_views") or []
+        if not tops and isinstance(channels, dict):
+            allv = []
+            for c in channels.values():
+                if isinstance(c, dict):
+                    allv += (c.get("videos") or [])
+            tops = sorted(allv, key=lambda v: (v or {}).get("views", 0) or 0, reverse=True)
+        tv_lines = []
+        for v in tops[:3]:
+            if not isinstance(v, dict):
+                continue
+            title = (v.get("title") or v.get("content") or v.get("caption") or "(無標題)")
+            title = " ".join(str(title).split())[:50]
+            tv_lines.append(f"- [{_fmt_int(v.get('views', 0))} 觀看 / {_fmt_int(v.get('likes', 0))} 讚] {title}")
+        if tv_lines:
+            parts.append("熱門內容：\n" + "\n".join(tv_lines))
+
+        # 平台既有 AI 觀察（截斷補充）
+        ai = (d.get("ai_report") or "").strip()
+        if ai:
+            parts.append("平台觀察：" + " ".join(ai.split())[:300])
+        parts.append("")
+    return "\n".join(parts), stats
+
+
+def _synthesize_competitor_insights(digest: str, profile_name: str) -> dict | None:
+    """用 Claude Opus 4.8 讀懂競品數據，產出三維度洞察（各≤200字）。"""
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        log.error("綜合分析失敗：缺 ANTHROPIC_API_KEY")
+        return None
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key)
+        system = (
+            f"你是資深社群行銷顧問，為「KT BIKER」（{profile_name}）品牌主分析本期跨平台競品戰情。"
+            "★自家品牌 標記的是 KT BIKER 自己，其餘為競品。"
+            "你的讀者是忙碌的品牌主，要的是『能直接讀懂、可立刻執行』的重點，不是數據複述。"
+            "用繁體中文、口語精簡、具體可行；每個維度嚴格控制在 200 字以內。"
+        )
+        prompt = (
+            "以下是本期 5 平台競品數據摘要：\n\n" + digest + "\n\n"
+            "請產出三個維度：\n"
+            "1. 社群經營觀察：本期競品與自家在內容、互動、平台佈局上的關鍵態勢（200字內）\n"
+            "2. 競爭突破點：自家相對競品最有機會切入/拉開差距的點（200字內）\n"
+            "3. 具體行動建議：3 點可立刻執行的具體做法（每點一句話，可含題材/平台/形式）"
+        )
+        resp = client.messages.create(
+            model="claude-opus-4-8",
+            max_tokens=2000,
+            system=system,
+            messages=[{"role": "user", "content": prompt}],
+            output_config={"format": {"type": "json_schema", "schema": {
+                "type": "object",
+                "properties": {
+                    "observation": {"type": "string"},
+                    "breakthrough": {"type": "string"},
+                    "actions": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["observation", "breakthrough", "actions"],
+                "additionalProperties": False,
+            }}},
+        )
+        text = next((b.text for b in resp.content if b.type == "text"), "")
+        data = json.loads(text)
+        acts = [str(a).strip() for a in (data.get("actions") or []) if str(a).strip()][:3]
+        if data.get("observation") and data.get("breakthrough") and acts:
+            data["actions"] = acts
+            log.info("競品綜合分析完成（Opus 4.8）")
+            return data
+        log.warning("綜合分析輸出缺欄位")
+        return None
+    except Exception as e:
+        log.error(f"綜合分析失敗: {e}")
+        return None
+
+
+def _build_summary_html(profile_name: str, insights: dict, urls: dict, stats: list) -> str:
+    """產生客戶端綜合分析報告 HTML（三段洞察 + 各平台數據 + 5 份明細連結）。"""
+    today = datetime.now(__import__("datetime").timezone(__import__("datetime").timedelta(hours=8))).strftime("%Y-%m-%d")
+    dr = next((s["date_range"] for s in stats if s.get("date_range")), today)
+
+    def esc(t):
+        return (str(t).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+    actions_html = "".join(f"<li>{esc(a)}</li>" for a in insights.get("actions", []))
+    stat_rows = "".join(
+        f"<tr><td>{esc(s['label'])}</td><td>{s['active']}/{s['total_ch']}</td>"
+        f"<td>{s['total_vid']}</td><td>{_fmt_int(s['avg_views'])}</td></tr>"
+        for s in stats)
+    link_btns = "".join(
+        f'<a class="btn" href="{urls[k]}" target="_blank" rel="noopener">{_PLATFORM_LABELS.get(suf, k)} 明細 ↗</a>'
+        for suf, k in _SUFFIX_TO_KEY.items() if urls.get(k))
+
+    return f"""<!DOCTYPE html>
+<html lang="zh-Hant" translate="no">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="google" content="notranslate">
+<title>競品綜合分析週報｜{esc(profile_name)}</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:-apple-system,"PingFang TC","Microsoft JhengHei",sans-serif;background:#f5f6f8;color:#1d2129;line-height:1.7;padding:20px}}
+.wrap{{max-width:760px;margin:0 auto}}
+header{{text-align:center;padding:24px 0 12px}}
+header h1{{font-size:24px;color:#0b5cad}}
+header .sub{{color:#65676b;font-size:14px;margin-top:6px}}
+.card{{background:#fff;border-radius:14px;padding:22px 24px;margin:16px 0;box-shadow:0 2px 10px rgba(0,0,0,.05)}}
+.card h2{{font-size:18px;color:#0b5cad;margin-bottom:12px;display:flex;align-items:center;gap:8px}}
+.card p{{font-size:16px}}
+.card ol{{padding-left:22px}}
+.card ol li{{font-size:16px;margin:8px 0}}
+table{{width:100%;border-collapse:collapse;font-size:15px}}
+th,td{{padding:9px 6px;text-align:center;border-bottom:1px solid #eceef0}}
+th{{color:#65676b;font-weight:600}}
+td:first-child,th:first-child{{text-align:left}}
+.links{{display:flex;flex-wrap:wrap;gap:10px;margin-top:6px}}
+.btn{{display:inline-block;padding:10px 16px;background:#0b5cad;color:#fff;text-decoration:none;border-radius:8px;font-size:14px}}
+footer{{text-align:center;color:#9aa0a6;font-size:13px;padding:20px 0}}
+</style>
+</head>
+<body><div class="wrap">
+<header>
+<h1>📊 競品綜合分析週報</h1>
+<div class="sub">{esc(profile_name)}｜{esc(dr)}</div>
+</header>
+
+<div class="card"><h2>📡 社群經營觀察</h2><p>{esc(insights['observation'])}</p></div>
+<div class="card"><h2>🎯 競爭突破點</h2><p>{esc(insights['breakthrough'])}</p></div>
+<div class="card"><h2>✅ 具體行動建議</h2><ol>{actions_html}</ol></div>
+
+<div class="card"><h2>📈 各平台關鍵數據</h2>
+<table><thead><tr><th>平台</th><th>活躍帳號</th><th>內容數</th><th>平均觀看</th></tr></thead>
+<tbody>{stat_rows}</tbody></table></div>
+
+<div class="card"><h2>🔍 平台明細報表</h2>
+<div class="links">{link_btns}</div></div>
+
+<footer>本週報由 AI 綜合近 7 天 5 平台競品數據生成｜僅供內部參考</footer>
+</div></body></html>"""
+
+
 def push_competitor_report(profile_keyword: str | None = None, target: str = "both"):
     if not _webapp_ready():
         if not _start_webapp():
@@ -478,30 +716,65 @@ def push_competitor_report(profile_keyword: str | None = None, target: str = "bo
         except Exception as e:
             log.warning(f"{platform} 補發例外: {e}")
 
-    lines = [f"📈 競品分析報表｜{profile_name}\n"]
-    failed = []
-    for platform, url in urls.items():
-        if url:
-            lines.append(f"▸ {platform_names.get(platform, platform)}\n{url}")
-        else:
-            failed.append(platform_names.get(platform, platform))
-            log.warning(f"平台發布失敗或無資料: {platform}")
-
+    failed = [platform_names.get(p, p) for p, u in urls.items() if not u]
     if failed:
-        lines.append(f"\n⚠️ 以下平台未能發布：{', '.join(failed)}")
         log.warning(f"未發布平台: {failed}")
-
-    if len(lines) == 1:
+    if not any(urls.values()):
         push("⚠️ 競品分析完成，但所有平台均無報告可發布。")
         return None
 
-    message = "\n".join(lines)
+    # 5 份平台明細備用文字（綜合分析若失敗時的 fallback）
+    detail_lines = [f"📈 競品分析報表｜{profile_name}\n"]
+    for platform, url in urls.items():
+        if url:
+            detail_lines.append(f"▸ {platform_names.get(platform, platform)}\n{url}")
+    detail_msg = "\n".join(detail_lines)
+
+    # ── 綜合分析：讀懂 5 平台 → Claude 三維度洞察 → 發綜合報告頁 → 推 J大審核 ──
+    summary_msg = None
+    try:
+        results = _load_competitor_results(profile_id)
+        if results:
+            digest, stats = _build_competitor_digest(results)
+            insights = _synthesize_competitor_insights(digest, profile_name)
+            if insights:
+                summary_url = None
+                try:
+                    shopee_str = str(SHOPEE_TOOL_DIR)
+                    if shopee_str not in sys.path:
+                        sys.path.insert(0, shopee_str)
+                    from core.reporter.cf_pages_uploader import PagesUploader
+                    settings = json.loads((SHOPEE_TOOL_DIR / "config" / "settings.json").read_text(encoding="utf-8"))
+                    cf_token = settings.get("cf_api_token", "").strip()
+                    if cf_token:
+                        html = _build_summary_html(profile_name, insights, urls, stats)
+                        summary_url = PagesUploader(cf_token).upload(html, site_key="competitor_summary")
+                        log.info(f"綜合分析報告已發布: {summary_url}")
+                except Exception as e:
+                    log.error(f"綜合報告發布失敗: {e}")
+
+                acts = "\n".join(f"{i}. {a}" for i, a in enumerate(insights["actions"], 1))
+                summary_msg = (
+                    f"📊 競品綜合分析週報｜{profile_name}\n\n"
+                    f"【社群經營觀察】\n{insights['observation']}\n\n"
+                    f"【競爭突破點】\n{insights['breakthrough']}\n\n"
+                    f"【具體行動建議】\n{acts}"
+                )
+                if summary_url:
+                    summary_msg += f"\n\n📄 完整報告（含 5 平台明細）\n{summary_url}"
+    except Exception as e:
+        log.error(f"綜合分析流程例外: {e}")
+
+    # 投遞契約與其他報表一致：target≠cc_only→推員工群；一律回傳訊息，
+    # 供呼叫端（CC bot 投遞給 reply_to_user_id／排程 __main__ 主動 push_cc）使用。
+    # 不在此主動 push_cc，避免與 CC bot 投遞重複推送。
+    out_msg = summary_msg or (detail_msg + "\n\n⚠️ 綜合分析未生成，附 5 平台明細供參考。")
     if target != "cc_only":
-        push(message)
-        log.info(f"競品報表推播完成：{len(lines) - 1} 個平台（→員工群）")
+        push(out_msg)
+        log.info("競品綜合分析週報已推播（→員工群）")
     else:
-        log.info(f"競品報表完成：{len(lines) - 1} 個平台（僅回傳 CC）")
-    return message
+        log.info("競品綜合分析週報完成（僅回傳，由呼叫端投遞）")
+    return out_msg
 
 
 # ── 競品戰情室進階指令 ────────────────────────────────────────────────────────
@@ -937,7 +1210,13 @@ if __name__ == "__main__":
     if mode == "shopee":
         push_shopee_report()
     elif mode == "competitor":
-        push_competitor_report()
+        # 每週一排程（launchd，無 CC bot 投遞）：審核期只發 J大(cc)，穩定後改員工群
+        if COMPETITOR_SUMMARY_TARGET == "group":
+            push_competitor_report(target="both")          # 自動發員工群
+        else:
+            _msg = push_competitor_report(target="cc_only")  # 不發群、回傳訊息
+            if _msg:
+                push_cc(_msg)                                # 主動推給 J大審核
     elif mode == "product_perf":
         push_product_perf_report()
     elif mode == "short_video":
