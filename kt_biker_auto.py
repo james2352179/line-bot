@@ -37,8 +37,8 @@ COMPETITOR_DIR    = Path("/Users/kuanghao/Downloads/kuanghao-claude/kh_competito
 COMPETITOR_URL    = "http://127.0.0.1:5173"
 COMPETITOR_PID    = "3b1c961a"   # 汽車美容用品業
 COMPETITOR_PROFILES_DIR = COMPETITOR_DIR / "webapp" / "data" / "profiles"
-# 競品「綜合分析報告」推送目標：審核期先發給 J大(CC)，穩定後改 "group" 自動發員工群
-COMPETITOR_SUMMARY_TARGET = "cc"   # "cc" → 推 J大個人；"group" → 推員工群
+# 競品「綜合分析週報」推送目標（2026-06-15 審核通過，切自動發員工群）
+COMPETITOR_SUMMARY_TARGET = "group"   # "cc" → 推 J大個人審核；"group" → 自動發員工群
 # 競品戰情室 webapp 的依賴（flask/playwright/pywebview）裝在系統 python3，
 # 與手動雙擊 launch.command 用的直譯器一致；勿改回 homebrew python3.12（缺 flask 會啟動逾時）
 PYTHON            = "/usr/bin/python3"
