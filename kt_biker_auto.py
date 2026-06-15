@@ -331,6 +331,46 @@ def _start_webapp():
     return False
 
 
+def _chromium_exists() -> bool:
+    """用 webapp 同一個直譯器(PYTHON)檢查 Playwright Chromium executable 是否存在。"""
+    check = (
+        "from playwright.sync_api import sync_playwright; from pathlib import Path; "
+        "p=sync_playwright().start(); ok=Path(p.chromium.executable_path).exists(); "
+        "p.stop(); print('OK' if ok else 'MISSING')"
+    )
+    try:
+        r = subprocess.run([PYTHON, "-c", check], cwd=str(COMPETITOR_DIR),
+                           capture_output=True, text=True, timeout=30)
+        return r.stdout.strip().endswith("OK")
+    except Exception as e:
+        log.warning(f"chromium 檢查失敗: {e}")
+        return False
+
+
+def _ensure_chromium_ready(timeout: int = 180) -> bool:
+    """跑分析前確認 Playwright Chromium 已就緒，根治冷啟動 race。
+    webapp(app.py)冷啟動會背景下載 chromium，若沒等它裝完就跑分析，
+    IG/FB/Threads 會 'BrowserType.launch: Executable doesn't exist' 全部失敗。
+    正常情況 chromium 已在 → 第一次輪詢即過、零延遲；只有首次冷啟動會等。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _chromium_exists():
+            return True
+        log.info("等待 Playwright Chromium 背景下載完成…")
+        time.sleep(5)
+    # 等背景下載逾時仍沒有 → 主動補裝一次當 fallback
+    log.warning("Chromium 背景下載逾時，主動補裝…")
+    try:
+        subprocess.run([PYTHON, "-m", "playwright", "install", "chromium"],
+                       cwd=str(COMPETITOR_DIR), capture_output=True, timeout=300)
+    except Exception as e:
+        log.error(f"chromium 補裝失敗: {e}")
+    ok = _chromium_exists()
+    if not ok:
+        log.error("⚠️ Chromium 仍未就緒，IG/FB/Threads 可能失敗")
+    return ok
+
+
 def _run_analysis_and_wait():
     """觸發全平台分析，等待 SSE done 事件，最多等 90 分鐘。
     若分析已在進行中（409），改為輪詢 /status 等待結束。
@@ -379,6 +419,8 @@ def push_competitor_report(profile_keyword: str | None = None, target: str = "bo
             push("⚠️ 競品戰情室啟動逾時，請手動執行。")
             log.error("webapp 啟動失敗")
             return None
+        # 冷啟動後 chromium 可能還在背景下載，跑分析前先擋一道，避免 IG/FB/Threads 全掛
+        _ensure_chromium_ready()
 
     # 決定設定檔 ID
     profile_id = COMPETITOR_PID
