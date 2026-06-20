@@ -313,6 +313,22 @@ def query_route(origin: str, destination: str) -> str:
         logger.error(f"query_route error: {e}")
         return "路線查詢失敗，請稍後再試 😅"
 
+# Haiku 偶爾會在 JSON 前後夾說明文字（即使要求純 JSON），單純去 ``` 擋不住 → json.loads 拋例外。
+# 一律抓出第一個完整 {...} 區塊再解析，容忍前後散文。
+_JSON_ONLY_SYSTEM = "你是嚴格的解析器。只能輸出 JSON 或單一個 null，禁止任何說明、前言、註解或 markdown 文字。"
+
+
+def _extract_json_obj(raw: str):
+    """從 LLM 回應抽出第一個 JSON 物件；找不到或為 null 回傳 None。"""
+    raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw.strip()).strip()
+    if not raw or raw.lower() == 'null':
+        return None
+    m = re.search(r'\{.*\}', raw, re.DOTALL)
+    if not m:
+        return None
+    return json.loads(m.group(0))
+
+
 def parse_reminder_request(question: str) -> dict | None:
     """用 Claude Haiku 解析提醒請求，回傳 {'target_at': ISO8601, 'message': str} 或 None"""
     from datetime import timezone, timedelta as _td
@@ -333,13 +349,10 @@ def parse_reminder_request(question: str) -> dict | None:
               f"如果不是，只輸出：null")
     try:
         resp = claude.messages.create(
-            model="claude-haiku-4-5-20251001", max_tokens=100,
+            model="claude-haiku-4-5-20251001", max_tokens=160,
+            system=_JSON_ONLY_SYSTEM,
             messages=[{"role": "user", "content": prompt}])
-        raw = resp.content[0].text.strip()
-        raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw).strip()
-        if raw.lower() == 'null' or not raw:
-            return None
-        result = json.loads(raw)
+        result = _extract_json_obj(resp.content[0].text)
         if isinstance(result, dict) and 'target_at' in result and 'message' in result:
             return result
         return None
@@ -382,13 +395,10 @@ def parse_reminder_modify(question: str) -> dict | None:
               f"如果不是，只輸出：null")
     try:
         resp = claude.messages.create(
-            model="claude-haiku-4-5-20251001", max_tokens=80,
+            model="claude-haiku-4-5-20251001", max_tokens=120,
+            system=_JSON_ONLY_SYSTEM,
             messages=[{"role": "user", "content": prompt}])
-        raw = resp.content[0].text.strip()
-        raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw).strip()
-        if raw.lower() == 'null' or not raw:
-            return None
-        result = json.loads(raw)
+        result = _extract_json_obj(resp.content[0].text)
         if isinstance(result, dict) and 'keyword' in result and 'target_at' in result:
             return result
         return None
