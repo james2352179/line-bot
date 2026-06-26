@@ -13,6 +13,7 @@ from linebot.v3.webhooks import MessageEvent, TextMessageContent, JoinEvent
 from linebot.v3.exceptions import InvalidSignatureError
 import anthropic
 import googlemaps
+import flood_api  # 路線淹水雷達核心（民生公共物聯網 SensorThings 淹水感測器）
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime, timedelta
 from supabase import create_client
@@ -1246,6 +1247,48 @@ def on_family_join(event):
     if hasattr(event.source, 'group_id'):
         logger.info(f"[家族] 加入群組 ID: {event.source.group_id}")
 
+# ── 淹水查詢（路線淹水雷達 LINE 版）──────────────────────────
+# 台南行政區（含區名前綴的淹水感測站可用區名子字串比對）
+# 刻意不含單字「東/南/北/中西」避免與「台南/南化」誤撞
+_TAINAN_DISTRICTS = [
+    "玉井", "南化", "左鎮", "楠西", "大內", "山上", "新化", "關廟", "龍崎",
+    "官田", "六甲", "東山", "白河", "仁德", "歸仁", "永康", "安南", "安平",
+    "佳里", "學甲", "麻豆", "下營", "柳營", "新營", "後壁", "鹽水", "西港",
+    "七股", "將軍", "北門", "善化", "新市", "安定",
+]
+
+
+def query_flood(question: str) -> str:
+    """內莉淹水查詢：從問句抓台南區名→回報沿線淹水感測器即時積水。"""
+    found = [d for d in _TAINAN_DISTRICTS if d in question]
+    if not found:
+        return ("想查哪一區會不會淹水呢？跟我說區名就好 🌧\n"
+                "例如：「玉井 南化 左鎮 淹水」")
+    res = flood_api.query(found)
+    if not res.get("ok"):
+        return f"抱歉，淹水資料查詢失敗了 😢（{res.get('error', '')[:40]}）"
+    sts = res["stations"]
+    missing = res.get("missing", [])
+    v = flood_api.overall_verdict(sts)
+    t = res["queried_at"].strftime("%H:%M")
+    lines = [f"🌧 淹水雷達（{t} 更新）", f"總結：{v['label']} — {v['advice']}", ""]
+    if not sts:
+        lines.append("此範圍查無淹水感測站。")
+    for s in sts[:12]:
+        emoji = s["level"]["label"].split()[0]  # 🟢/🟡/🟠/🔴
+        tt = s["time"].strftime("%H:%M") if s["time"] else "—"
+        warn = " ⚠️舊資料" if s["stale"] else ""
+        lines.append(f"{emoji} {s['name']} {s['depth_cm']:.0f}cm @{tt}{warn}")
+        if s["depth_cm"] > 0 and s.get("cctv"):
+            lines.append(f"   📷 {s['cctv']}")
+    if missing:
+        lines.append("")
+        lines.append(f"⚠️ {'、'.join(missing)}：查無感測站，需看 CCTV／封路，別當成沒淹")
+    lines.append("")
+    lines.append("（只看點位積水，不含坍方／封橋／封路，山路請另查封路資訊）")
+    return "\n".join(lines)
+
+
 @family_handler.add(MessageEvent, message=TextMessageContent)
 def on_family_message(event):
     text = event.message.text.strip()
@@ -1278,6 +1321,19 @@ def on_family_message(event):
         question = text
 
     def _reply():
+        # 淹水查詢（路線淹水雷達）— 放最前，優先於天氣/路程
+        is_flood_q = bool(re.search(r'淹水|積水|淹大水|會不會淹|水淹|涉水|路.{0,3}積水', question))
+        if is_flood_q:
+            reply_text = query_flood(question)
+            try:
+                with ApiClient(family_config) as api_client:
+                    MessagingApi(api_client).reply_message(
+                        ReplyMessageRequest(reply_token=event.reply_token,
+                                            messages=[TextMessage(text=reply_text)]))
+            except Exception as e:
+                logger.error(f"[家族 淹水] reply error: {e}")
+            return
+
         # 潮汐查詢（釣魚、挖蛤蜊、潮汐相關）
         is_tide_q = bool(re.search(r'釣魚|挖蛤蜊|潮汐|退潮|漲潮|滿潮|乾潮|捕魚|海釣|磯釣|蚵仔|潮水', question))
         if is_tide_q:
