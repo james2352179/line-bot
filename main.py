@@ -16,6 +16,7 @@ from linebot.v3.exceptions import InvalidSignatureError
 import anthropic
 import googlemaps
 import flood_api  # 路線淹水雷達核心（民生公共物聯網 SensorThings 淹水感測器）
+import tdx_api    # TDX 即時路況封路/管制（路名比對）
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime, timedelta
 from supabase import create_client
@@ -1324,10 +1325,12 @@ def query_flood_route(link: str) -> str:
             return "找不到這條路線的開車路徑 😢，請確認起訖點。"
         leg = d[0]["legs"][0]
         segments = []
+        instrs = []
         for st in leg["steps"]:
             pts = googlemaps.convert.decode_polyline(st["polyline"]["points"])
             plist = [(p["lat"], p["lng"]) for p in pts]
             instr = re.sub(r"<[^>]+>", "", st.get("html_instructions", ""))
+            instrs.append(instr)
             segments.append((plist, flood_api.is_highway_step(instr)))
     except Exception as e:
         logger.error(f"[家族 淹水路線] directions error: {e}")
@@ -1340,8 +1343,34 @@ def query_flood_route(link: str) -> str:
     t = allres["queried_at"].strftime("%H:%M")
     dest_short = dest.split('臺南市')[-1] if '臺南市' in dest else dest
 
+    # 沿線封路/管制（TDX，路名比對）
+    roads = tdx_api.extract_route_roads(instrs)
+    counties = list(tdx_api._COUNTY_RE.findall(tdx_api._norm(dest)))
+    alerts = tdx_api.route_alerts(
+        os.environ.get("TDX_CLIENT_ID", ""), os.environ.get("TDX_CLIENT_SECRET", ""),
+        roads, region_hints=[dest_short, "台南"], allowed_counties=counties or ["台南"])
+
     out = [f"🗺 路線淹水分析（{t} 更新）", f"→ {dest_short}",
            f"全程 {leg['distance']['text']} · 約 {leg['duration']['text']} · 沿線 {len(near)} 站", ""]
+
+    # 封路示警放最前（安全最優先）
+    if alerts.get("ok"):
+        if alerts["closed"]:
+            out.append("🚧 沿線封路／管制（高優先）：")
+            for c in alerts["closed"][:6]:
+                out.append(f"⛔ {c['title'][:80]}")
+            out.append("")
+        if alerts["weather"]:
+            out.append("🌧 路況天氣提醒：")
+            for w in alerts["weather"][:3]:
+                out.append(f"• {w['title'][:70]}")
+            out.append("")
+        if alerts["closed_far"]:
+            out.append(f"（另有 {len(alerts['closed_far'])} 筆同路名封閉但在他縣，可能不在你路段；如需可查公路局168）")
+            out.append("")
+    elif alerts.get("error"):
+        out.append(f"（⚠️封路資訊暫不可用：{alerts['error']}）")
+        out.append("")
     if not near:
         out.append("沿線 0.8km 內查無淹水感測站。\n（不代表沒淹，山路請另查封路資訊）")
         return "\n".join(out)
@@ -1379,7 +1408,7 @@ def query_flood_route(link: str) -> str:
     if normal:
         out.append(f"\n🟢 其餘 {normal} 站正常")
     out.append("")
-    out.append("（只看點位積水，不含坍方／封橋／封路，山路請另查封路）")
+    out.append("（淹水＝點位感測；封路＝國道/省道事件，小路坍方未必涵蓋，山區仍請留意）")
     return "\n".join(out)
 
 
