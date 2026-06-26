@@ -1323,8 +1323,12 @@ def query_flood_route(link: str) -> str:
         if not d:
             return "找不到這條路線的開車路徑 😢，請確認起訖點。"
         leg = d[0]["legs"][0]
-        pts = googlemaps.convert.decode_polyline(d[0]["overview_polyline"]["points"])
-        route_pts = [(p["lat"], p["lng"]) for p in pts]
+        segments = []
+        for st in leg["steps"]:
+            pts = googlemaps.convert.decode_polyline(st["polyline"]["points"])
+            plist = [(p["lat"], p["lng"]) for p in pts]
+            instr = re.sub(r"<[^>]+>", "", st.get("html_instructions", ""))
+            segments.append((plist, flood_api.is_highway_step(instr)))
     except Exception as e:
         logger.error(f"[家族 淹水路線] directions error: {e}")
         return "路線規劃失敗了 😢，請稍後再試。"
@@ -1332,7 +1336,7 @@ def query_flood_route(link: str) -> str:
     allres = flood_api.query_tainan_all()
     if not allres.get("ok"):
         return "淹水感測資料暫時取不到 😢，請稍後再試。"
-    near = flood_api.filter_near_route(allres["stations"], route_pts, radius_km=0.8)
+    near = flood_api.classify_near_route(allres["stations"], segments, radius_km=0.8)
     t = allres["queried_at"].strftime("%H:%M")
     dest_short = dest.split('臺南市')[-1] if '臺南市' in dest else dest
 
@@ -1342,27 +1346,40 @@ def query_flood_route(link: str) -> str:
         out.append("沿線 0.8km 內查無淹水感測站。\n（不代表沒淹，山路請另查封路資訊）")
         return "\n".join(out)
 
-    v = flood_api.overall_verdict(near)
-    out.append(f"總結：{v['label']} — {v['advice']}")
-    flooded = [s for s in near if s["depth_cm"] > 0]
-    if flooded:
+    surface = [s for s in near if not s["highway"]]
+    highway = [s for s in near if s["highway"]]
+    # 總結以「平面路段」為準（高架旁淹水多在路面下方，不影響行駛）
+    v = flood_api.overall_verdict(surface if surface else near)
+    out.append(f"總結：{v['label']} — {v['advice']}（以平面路段為準）")
+
+    def _line(s):
+        emoji = s["level"]["label"].split()[0]
+        tt = s["time"].strftime("%H:%M") if s["time"] else "—"
+        warn = " ⚠️舊資料" if s["stale"] else ""
+        rows = [f"{emoji} {s['name']} {s['depth_cm']:.0f}cm（距路線{s['dist_km']*1000:.0f}m @{tt}{warn}）"]
+        if s.get("cctv"):
+            rows.append(f"   📷 {s['cctv']}")
+        return rows
+
+    sf = [s for s in surface if s["depth_cm"] > 0]
+    hf = [s for s in highway if s["depth_cm"] > 0]
+    if sf:
         out.append("")
-        out.append("⚠️ 積水路段：")
-        for s in flooded:
-            emoji = s["level"]["label"].split()[0]
-            tt = s["time"].strftime("%H:%M") if s["time"] else "—"
-            warn = " ⚠️舊資料" if s["stale"] else ""
-            out.append(f"{emoji} {s['name']} {s['depth_cm']:.0f}cm"
-                       f"（距路線{s['dist_km']*1000:.0f}m @{tt}{warn}）")
-            if s.get("cctv"):
-                out.append(f"   📷 {s['cctv']}")
-        normal = len(near) - len(flooded)
-        if normal:
-            out.append(f"\n🟢 其餘 {normal} 站正常")
-    else:
+        out.append("⚠️ 平面路段積水（會影響行駛）：")
+        for s in sf:
+            out += _line(s)
+    if hf:
+        out.append("")
+        out.append("🛣️ 高架/匝道旁積水（多在路面下方，通常不影響；匝道、涵洞請留意）：")
+        for s in hf:
+            out += _line(s)
+    if not sf and not hf:
         out.append("沿線各站目前皆無積水 🟢")
+    normal = len(near) - len(sf) - len(hf)
+    if normal:
+        out.append(f"\n🟢 其餘 {normal} 站正常")
     out.append("")
-    out.append("（沿線0.8km內點位積水；不含坍方／封橋／封路，山路請另查封路）")
+    out.append("（只看點位積水，不含坍方／封橋／封路，山路請另查封路）")
     return "\n".join(out)
 
 

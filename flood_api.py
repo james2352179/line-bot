@@ -9,6 +9,7 @@
   ./venv/bin/python3.12 flood_api.py 玉井 南化 左鎮
 """
 from __future__ import annotations
+import re
 import sys
 import datetime as dt
 from typing import List, Dict, Any
@@ -168,6 +169,44 @@ def filter_near_route(stations: List[Dict[str, Any]],
             s["dist_km"] = dmin
             out.append(s)
     out.sort(key=lambda s: (-s["depth_cm"], s["dist_km"]))
+    return out
+
+
+# 判斷某路段指示文字是否屬「國道/快速道路/高架匝道」（避免誤抓含「高速」的平面街名）
+_HIGHWAY_RE = re.compile(
+    r'國道|高速公路|快速道路|匝道|交流道|系統交流道|高架|'
+    r'Freeway|Expressway|merge onto|Toll road|on the ramp|the ramp on',
+    re.I)
+
+
+def is_highway_step(instruction: str) -> bool:
+    return bool(_HIGHWAY_RE.search(instruction or ""))
+
+
+def classify_near_route(stations: List[Dict[str, Any]],
+                        segments: List[tuple], radius_km: float = 0.8):
+    """
+    沿線比對並標記路段型態。
+    segments: [(points_list, is_highway_bool), ...]（每個 Directions step 一段）
+    每站附 dist_km 與 highway(bool=最近路段是否國道/高架)。
+    """
+    flat = [(la, lo, hw) for pts, hw in segments for (la, lo) in pts]
+    out = []
+    for s in stations:
+        if s.get("lat") is None or s.get("lon") is None:
+            continue
+        best_d, best_hw = 9e9, False
+        for la, lo, hw in flat:
+            d = haversine(s["lat"], s["lon"], la, lo)
+            if d < best_d:
+                best_d, best_hw = d, hw
+        if best_d <= radius_km:
+            s2 = dict(s)
+            s2["dist_km"] = best_d
+            s2["highway"] = best_hw
+            out.append(s2)
+    # 平面段(直接影響)排前，再依深度
+    out.sort(key=lambda s: (s["highway"], -s["depth_cm"], s["dist_km"]))
     return out
 
 
