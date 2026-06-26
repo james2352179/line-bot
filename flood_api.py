@@ -62,9 +62,21 @@ def query(townships: List[str], timeout: int = 25) -> Dict[str, Any]:
         return {"ok": False, "error": "未輸入鄉鎮", "stations": [], "queried_at": dt.datetime.now(TZ8)}
 
     flt = " or ".join(f"substringof('{t}',properties/stationName)" for t in towns)
+    ok, stations, err = _request_stations(flt, timeout)
+    if not ok:
+        return {"ok": False, "error": err, "stations": [], "queried_at": dt.datetime.now(TZ8)}
+    # 覆蓋率檢查：哪些鄉鎮在此資料源「查無淹水感測站」
+    # （重要安全提醒：查無站 ≠ 沒淹，可能根本沒裝感測器，需改看 CCTV／封路）
+    missing = [t for t in towns if not any(t in s["name"] for s in stations)]
+    return {"ok": True, "error": "", "stations": stations,
+            "missing": missing, "queried_at": dt.datetime.now(TZ8)}
+
+
+def _request_stations(odata_filter: str, timeout: int = 25):
+    """以 OData $filter 取淹水感測站並解析。回傳 (ok, stations, error)。"""
     params = {
-        "$filter": flt,
-        "$top": "300",
+        "$filter": odata_filter,
+        "$top": "400",
         "$expand": (
             "Locations($select=location),"
             "Datastreams($select=unitOfMeasurement;"
@@ -78,7 +90,7 @@ def query(townships: List[str], timeout: int = 25) -> Dict[str, Any]:
         r.raise_for_status()
         data = r.json()
     except Exception as e:
-        return {"ok": False, "error": f"連線失敗：{e}", "stations": [], "queried_at": dt.datetime.now(TZ8)}
+        return False, [], f"連線失敗：{e}"
 
     now = dt.datetime.now(TZ8)
     stations: List[Dict[str, Any]] = []
@@ -86,7 +98,6 @@ def query(townships: List[str], timeout: int = 25) -> Dict[str, Any]:
         p = thing.get("properties", {})
         name = p.get("stationName") or thing.get("name", "未命名")
 
-        # 座標
         lat = lon = None
         locs = thing.get("Locations", [])
         if locs:
@@ -94,9 +105,7 @@ def query(townships: List[str], timeout: int = 25) -> Dict[str, Any]:
             if coords and len(coords) == 2:
                 lon, lat = coords[0], coords[1]
 
-        depth = None
-        otime = None
-        cctv = None
+        depth = otime = cctv = None
         for ds in thing.get("Datastreams", []):
             opname = (ds.get("ObservedProperty", {}) or {}).get("name", "")
             obs = ds.get("Observations", [])
@@ -114,24 +123,52 @@ def query(townships: List[str], timeout: int = 25) -> Dict[str, Any]:
                 if isinstance(val, str) and val.startswith("http"):
                     cctv = val
 
-        # 只保留有淹水深度感測的站（排除純水位/河川站）
-        if depth is None:
+        if depth is None:  # 排除純水位/河川站
             continue
-
         stale = bool(otime and (now - otime).total_seconds() > STALE_MIN * 60)
         stations.append({
             "name": name, "depth_cm": depth, "time": otime, "stale": stale,
             "cctv": cctv, "lat": lat, "lon": lon, "level": classify(depth),
         })
 
-    # 排序：深度由高到低（最危險的排最前）
     stations.sort(key=lambda s: s["depth_cm"], reverse=True)
+    return True, stations, ""
 
-    # 覆蓋率檢查：哪些鄉鎮在此資料源「查無淹水感測站」
-    # （重要安全提醒：查無站 ≠ 沒淹，可能根本沒裝感測器，需改看 CCTV／封路）
-    missing = [t for t in towns if not any(t in s["name"] for s in stations)]
-    return {"ok": True, "error": "", "stations": stations,
-            "missing": missing, "queried_at": now}
+
+def query_tainan_all(timeout: int = 30) -> Dict[str, Any]:
+    """取全台南淹水感測站（給路線沿線比對用）。"""
+    ok, stations, err = _request_stations(
+        "properties/authority eq '臺南市政府水利局'", timeout)
+    return {"ok": ok, "error": err, "stations": stations,
+            "queried_at": dt.datetime.now(TZ8)}
+
+
+def haversine(lat1, lon1, lat2, lon2) -> float:
+    """兩點球面距離（公里）。"""
+    import math
+    r = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def filter_near_route(stations: List[Dict[str, Any]],
+                      route_pts: List[tuple], radius_km: float = 0.8):
+    """保留距離路線任一點 <= radius_km 的感測站，附上 dist_km。"""
+    out = []
+    for s in stations:
+        if s.get("lat") is None or s.get("lon") is None:
+            continue
+        dmin = min((haversine(s["lat"], s["lon"], la, lo) for la, lo in route_pts),
+                   default=9e9)
+        if dmin <= radius_km:
+            s = dict(s)
+            s["dist_km"] = dmin
+            out.append(s)
+    out.sort(key=lambda s: (-s["depth_cm"], s["dist_km"]))
+    return out
 
 
 def overall_verdict(stations: List[Dict[str, Any]]) -> Dict[str, str]:

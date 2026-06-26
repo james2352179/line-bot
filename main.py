@@ -3,6 +3,8 @@ import json
 import logging
 import re
 import threading
+import urllib.parse
+import requests
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
 from linebot.v3.messaging import (
@@ -1289,6 +1291,81 @@ def query_flood(question: str) -> str:
     return "\n".join(lines)
 
 
+# Google 地圖連結偵測（短連結 / 完整地圖網址）
+_MAPS_LINK_RE = re.compile(
+    r'(https?://(?:maps\.app\.goo\.gl|goo\.gl/maps|maps\.google\.[^\s]+|'
+    r'(?:www\.)?google\.[^\s/]+/maps)[^\s]+)')
+
+
+def _resolve_route_link(link: str):
+    """解析 Google 地圖路線連結 → (origin, dest) 字串；非路線回 (None, None)。"""
+    try:
+        final = urllib.parse.unquote(
+            requests.get(link, allow_redirects=True, timeout=20,
+                         headers={"User-Agent": "Mozilla/5.0"}).url)
+    except Exception as e:
+        logger.error(f"[家族 淹水路線] resolve error: {e}")
+        return None, None
+    m = re.search(r'/maps/dir/([^/]+)/([^/@]+)', final)
+    if m:
+        return m.group(1).strip(), m.group(2).replace('+', ' ').strip()
+    return None, None
+
+
+def query_flood_route(link: str) -> str:
+    """貼路線連結 → 分析沿線（0.8km 內）淹水感測器即時積水。"""
+    origin, dest = _resolve_route_link(link)
+    if not origin:
+        return ("這看起來不是「路線」連結 🤔\n"
+                "請在 Google 地圖規劃好『路線』後，用分享鈕複製連結給我～")
+    try:
+        d = gmaps.directions(origin, dest, mode="driving")
+        if not d:
+            return "找不到這條路線的開車路徑 😢，請確認起訖點。"
+        leg = d[0]["legs"][0]
+        pts = googlemaps.convert.decode_polyline(d[0]["overview_polyline"]["points"])
+        route_pts = [(p["lat"], p["lng"]) for p in pts]
+    except Exception as e:
+        logger.error(f"[家族 淹水路線] directions error: {e}")
+        return "路線規劃失敗了 😢，請稍後再試。"
+
+    allres = flood_api.query_tainan_all()
+    if not allres.get("ok"):
+        return "淹水感測資料暫時取不到 😢，請稍後再試。"
+    near = flood_api.filter_near_route(allres["stations"], route_pts, radius_km=0.8)
+    t = allres["queried_at"].strftime("%H:%M")
+    dest_short = dest.split('臺南市')[-1] if '臺南市' in dest else dest
+
+    out = [f"🗺 路線淹水分析（{t} 更新）", f"→ {dest_short}",
+           f"全程 {leg['distance']['text']} · 約 {leg['duration']['text']} · 沿線 {len(near)} 站", ""]
+    if not near:
+        out.append("沿線 0.8km 內查無淹水感測站。\n（不代表沒淹，山路請另查封路資訊）")
+        return "\n".join(out)
+
+    v = flood_api.overall_verdict(near)
+    out.append(f"總結：{v['label']} — {v['advice']}")
+    flooded = [s for s in near if s["depth_cm"] > 0]
+    if flooded:
+        out.append("")
+        out.append("⚠️ 積水路段：")
+        for s in flooded:
+            emoji = s["level"]["label"].split()[0]
+            tt = s["time"].strftime("%H:%M") if s["time"] else "—"
+            warn = " ⚠️舊資料" if s["stale"] else ""
+            out.append(f"{emoji} {s['name']} {s['depth_cm']:.0f}cm"
+                       f"（距路線{s['dist_km']*1000:.0f}m @{tt}{warn}）")
+            if s.get("cctv"):
+                out.append(f"   📷 {s['cctv']}")
+        normal = len(near) - len(flooded)
+        if normal:
+            out.append(f"\n🟢 其餘 {normal} 站正常")
+    else:
+        out.append("沿線各站目前皆無積水 🟢")
+    out.append("")
+    out.append("（沿線0.8km內點位積水；不含坍方／封橋／封路，山路請另查封路）")
+    return "\n".join(out)
+
+
 @family_handler.add(MessageEvent, message=TextMessageContent)
 def on_family_message(event):
     text = event.message.text.strip()
@@ -1321,7 +1398,20 @@ def on_family_message(event):
         question = text
 
     def _reply():
-        # 淹水查詢（路線淹水雷達）— 放最前，優先於天氣/路程
+        # 路線淹水分析：偵測到 Google 地圖連結 → 自動分析沿線淹水（最優先）
+        mlink = _MAPS_LINK_RE.search(question)
+        if mlink:
+            reply_text = query_flood_route(mlink.group(1))
+            try:
+                with ApiClient(family_config) as api_client:
+                    MessagingApi(api_client).reply_message(
+                        ReplyMessageRequest(reply_token=event.reply_token,
+                                            messages=[TextMessage(text=reply_text)]))
+            except Exception as e:
+                logger.error(f"[家族 淹水路線] reply error: {e}")
+            return
+
+        # 淹水查詢（手打區名）— 優先於天氣/路程
         is_flood_q = bool(re.search(r'淹水|積水|淹大水|會不會淹|水淹|涉水|路.{0,3}積水', question))
         if is_flood_q:
             reply_text = query_flood(question)
